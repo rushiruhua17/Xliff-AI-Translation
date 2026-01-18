@@ -1,14 +1,17 @@
 import sys
 import os
 import time
+import difflib
 import qdarktheme # Modern theme
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QTableView, QFileDialog, 
                              QHeaderView, QMessageBox, QLabel, QAbstractItemView,
                              QComboBox, QLineEdit, QGroupBox, QMenu, QDockWidget,
-                             QTextEdit, QProgressBar, QSplitter, QFrame)
-from PyQt6.QtCore import Qt, QAbstractTableModel, QModelIndex, QThread, pyqtSignal, QSize
-from PyQt6.QtGui import QAction, QIcon, QColor, QBrush
+                             QTextEdit, QProgressBar, QSplitter, QFrame, QCheckBox,
+                             QToolBar, QSpacerItem, QSizePolicy)
+from PyQt6.QtCore import (Qt, QAbstractTableModel, QModelIndex, QThread, pyqtSignal, 
+                          QSize, QSettings, QSortFilterProxyModel, QRegularExpression)
+from PyQt6.QtGui import QAction, QIcon, QColor, QBrush, QKeySequence, QShortcut
 
 # Ensure core modules importable
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -119,17 +122,18 @@ class XliffTableModel(QAbstractTableModel):
         if role == Qt.ItemDataRole.DisplayRole or role == Qt.ItemDataRole.EditRole:
             if col == 0: return unit.id
             elif col == 1: 
-                # Text representation of state
-                return "" 
+                # Return State Emoji as TEXT
+                if unit.state == "locked": return "🔒"
+                elif unit.state == "translated": return "✅"
+                elif unit.state == "edited": return "✏️"
+                elif unit.state == "needs_translation": return "⚪"
+                return "⚪"
             elif col == 2: return unit.source_abstracted
             elif col == 3: return unit.target_abstracted
             
         elif role == Qt.ItemDataRole.DecorationRole and col == 1:
-            # Icons/Colors for State
-            if unit.state == "locked": return "🔒"
-            elif unit.state == "translated": return "✅"
-            elif unit.state == "edited": return "✏️"
-            return "⚪"
+            return None # We use DisplayRole for Emojis now
+
             
         elif role == Qt.ItemDataRole.ToolTipRole:
             if col == 1: return f"Status: {unit.state}"
@@ -147,7 +151,6 @@ class XliffTableModel(QAbstractTableModel):
         flags = super().flags(index)
         unit = self.units[index.row()]
         
-        # Target editable only if not locked
         if index.column() == 3:
             if unit.state != "locked":
                 flags |= Qt.ItemFlag.ItemIsEditable
@@ -163,7 +166,7 @@ class XliffTableModel(QAbstractTableModel):
                 unit.target_abstracted = value
                 unit.state = "edited"
                 self.dataChanged.emit(index, index, [Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.EditRole])
-                # Also notify state column changed
+                # Notify state column changed
                 idx_state = self.index(index.row(), 1)
                 self.dataChanged.emit(idx_state, idx_state, [Qt.ItemDataRole.DecorationRole])
                 return True
@@ -175,24 +178,79 @@ class XliffTableModel(QAbstractTableModel):
         self.endResetModel()
         
     def refresh_row(self, row_idx):
+        # We need to map actual data index to model index. 
+        # But here row_idx is absolute index.
         idx_start = self.index(row_idx, 0)
         idx_end = self.index(row_idx, 3)
         self.dataChanged.emit(idx_start, idx_end, [Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.DecorationRole])
+
+        
+class XliffFilterProxyModel(QSortFilterProxyModel):
+    def __init__(self):
+        super().__init__()
+        self.status_filter = "All"
+        self.text_filter = ""
+    
+    def lessThan(self, left, right):
+        # Numeric sorting for ID column (0)
+        if left.column() == 0 and right.column() == 0:
+            try:
+                l_id = int(self.sourceModel().data(left))
+                r_id = int(self.sourceModel().data(right))
+                return l_id < r_id
+            except:
+                pass # Fallback to string sort
+        return super().lessThan(left, right)
+
+    def set_status_filter(self, status):
+        self.status_filter = status
+        self.invalidateFilter()
+        
+    def set_text_filter(self, text):
+        self.text_filter = text.lower()
+        self.invalidateFilter()
+
+    def filterAcceptsRow(self, source_row, source_parent):
+        model = self.sourceModel()
+        unit = model.units[source_row]
+        
+        if self.status_filter != "All":
+            if self.status_filter == "Translated" and unit.state != "translated": return False
+            if self.status_filter == "Edited" and unit.state != "edited": return False
+            if self.status_filter == "Locked" and unit.state != "locked": return False
+            if self.status_filter == "Untranslated" and unit.state not in ["new", "needs_translation", None, ""]: 
+                if unit.target_abstracted: return False
+
+        if self.text_filter:
+            s_text = (unit.source_abstracted or "").lower()
+            t_text = (unit.target_abstracted or "").lower()
+            if self.text_filter not in s_text and self.text_filter not in t_text:
+                return False
+                
+        return True
 
 # --- Main Window ---
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("XLIFF AI Assistant Pro")
+        self.setWindowTitle("XLIFF AI Assistant Pro v2.0")
         self.resize(1400, 900)
+        
+        # Settings
+        self.settings = QSettings("Gemini", "XLIFF_AI_Assistant")
         
         # Data
         self.parser = None
         self.units = []
         self.abstractor = TagAbstractor()
-        self.current_file = None
-        self.active_unit_index = -1
+        
+        # Models
+        self.model = XliffTableModel()
+        self.proxy_model = XliffFilterProxyModel()
+        self.proxy_model.setSourceModel(self.model)
+        
+        self.active_unit_index_map = -1 # Mapped index in source model
         
         # Workers
         self.trans_worker = None
@@ -200,6 +258,7 @@ class MainWindow(QMainWindow):
         self.test_worker = None
         
         self.setup_ui()
+        self.load_settings()
         self.apply_styles()
 
     def setup_ui(self):
@@ -212,8 +271,8 @@ class MainWindow(QMainWindow):
         
         # --- Sidebar ---
         sidebar = QFrame()
-        sidebar.setFixedWidth(280)
-        sidebar.setObjectName("sidebar") # For styling
+        sidebar.setFixedWidth(300)
+        sidebar.setObjectName("sidebar") 
         side_layout = QVBoxLayout(sidebar)
         side_layout.setContentsMargins(15, 15, 15, 15)
         
@@ -230,13 +289,11 @@ class MainWindow(QMainWindow):
         l_lang.addWidget(QLabel("Source:"))
         self.combo_src = QComboBox()
         self.combo_src.addItems(["en", "zh-CN", "fr", "de", "ja", "ko"])
-        self.combo_src.setCurrentText("zh-CN") # Default
         l_lang.addWidget(self.combo_src)
         
         l_lang.addWidget(QLabel("Target:"))
         self.combo_tgt = QComboBox()
         self.combo_tgt.addItems(["en", "zh-CN", "fr", "de", "ja", "ko"])
-        self.combo_tgt.setCurrentText("en") # Default
         l_lang.addWidget(self.combo_tgt)
         grp_lang.setLayout(l_lang)
         side_layout.addWidget(grp_lang)
@@ -246,7 +303,8 @@ class MainWindow(QMainWindow):
         l_ai = QVBoxLayout()
         
         self.combo_provider = QComboBox()
-        self.combo_provider.addItems(["SiliconFlow", "OpenAI", "DeepSeek", "Mock"])
+        self.combo_provider.addItems(["SiliconFlow", "OpenAI", "DeepSeek"])
+        self.combo_provider.currentTextChanged.connect(self.on_provider_changed)
         l_ai.addWidget(QLabel("Provider:"))
         l_ai.addWidget(self.combo_provider)
         
@@ -256,7 +314,14 @@ class MainWindow(QMainWindow):
         l_ai.addWidget(QLabel("API Key:"))
         l_ai.addWidget(self.txt_apikey)
         
-        self.txt_model = QLineEdit("deepseek-ai/DeepSeek-V2.5")
+        # Base URL (conditionally shown or just integrated)
+        self.txt_base_url = QLineEdit()
+        self.txt_base_url.setPlaceholderText("https://...")
+        self.txt_base_url.setToolTip("Custom Base URL")
+        l_ai.addWidget(QLabel("Base URL:"))
+        l_ai.addWidget(self.txt_base_url)
+        
+        self.txt_model = QLineEdit()
         l_ai.addWidget(QLabel("Model:"))
         l_ai.addWidget(self.txt_model)
         
@@ -270,19 +335,28 @@ class MainWindow(QMainWindow):
         side_layout.addStretch()
         
         # Action Buttons
+        button_layout = QVBoxLayout()
+        button_layout.setSpacing(10)
+        
         self.btn_open = QPushButton("📂 Open File")
         self.btn_open.clicked.connect(self.open_file)
-        side_layout.addWidget(self.btn_open)
+        button_layout.addWidget(self.btn_open)
         
         self.btn_trans = QPushButton("🚀 Start Translation")
         self.btn_trans.clicked.connect(self.start_translation)
         self.btn_trans.setObjectName("btnPrimary")
-        side_layout.addWidget(self.btn_trans)
+        button_layout.addWidget(self.btn_trans)
         
         self.btn_save = QPushButton("💾 Export Result")
         self.btn_save.clicked.connect(self.save_file)
-        side_layout.addWidget(self.btn_save)
+        button_layout.addWidget(self.btn_save)
         
+        # Theme Toggle
+        self.btn_theme = QPushButton("🌓 Switch Theme")
+        self.btn_theme.clicked.connect(self.toggle_theme)
+        button_layout.addWidget(self.btn_theme)
+        
+        side_layout.addLayout(button_layout)
         main_layout.addWidget(sidebar)
         
         # --- Content Area ---
@@ -290,19 +364,50 @@ class MainWindow(QMainWindow):
         content_layout = QVBoxLayout(content)
         content_layout.setContentsMargins(10, 10, 10, 10)
         
-        # Top Bar (Stats)
+        # 1. Stats Bar
+        stats_layout = QHBoxLayout()
         self.lbl_stats = QLabel("No file loaded.")
-        content_layout.addWidget(self.lbl_stats)
+        stats_layout.addWidget(self.lbl_stats)
         
-        # Progress Bar
         self.progress = QProgressBar()
         self.progress.setVisible(False)
-        content_layout.addWidget(self.progress)
+        self.progress.setFixedWidth(200)
+        stats_layout.addStretch()
+        stats_layout.addWidget(self.progress)
+        content_layout.addLayout(stats_layout)
         
-        # Table
+        # 2. Advanced Filter Bar
+        filter_frame = QFrame()
+        filter_frame.setObjectName("filterBar") # Apply strict styling
+        filter_layout = QHBoxLayout(filter_frame)
+        filter_layout.setContentsMargins(5, 5, 5, 5)
+        
+        filter_layout.addWidget(QLabel("🔍"))
+        self.txt_search = QLineEdit()
+        self.txt_search.setPlaceholderText("Search source or target...")
+        self.txt_search.textChanged.connect(self.on_search_changed)
+        filter_layout.addWidget(self.txt_search)
+        
+        filter_layout.addSpacing(20)
+        filter_layout.addWidget(QLabel("Filter:"))
+        
+        self.btn_grp_filter = []
+        for name in ["All", "Untranslated", "Translated", "Edited", "Locked"]:
+            btn = QPushButton(name)
+            btn.setCheckable(True)
+            if name == "All": btn.setChecked(True)
+            # Exclusive check using simple logic or QButtonGroup (skipping QButtonGroup for explicit logic)
+            btn.clicked.connect(lambda checked, n=name: self.on_filter_btn_clicked(n))
+            filter_layout.addWidget(btn)
+            self.btn_grp_filter.append(btn)
+            
+        filter_layout.addStretch()
+        content_layout.addWidget(filter_frame)
+
+        # 3. Table
         self.table = QTableView()
-        self.model = XliffTableModel()
-        self.table.setModel(self.model)
+        self.table.setModel(self.proxy_model) 
+        self.table.setSortingEnabled(True)
         
         # Table Config
         h = self.table.horizontalHeader()
@@ -316,8 +421,11 @@ class MainWindow(QMainWindow):
         self.table.customContextMenuRequested.connect(self.show_context_menu)
         self.table.selectionModel().selectionChanged.connect(self.on_selection_changed)
         
-        content_layout.addWidget(self.table)
+        # Shortcuts
+        QShortcut(QKeySequence("Ctrl+Up"), self.table, lambda: self.navigate_grid(-1))
+        QShortcut(QKeySequence("Ctrl+Down"), self.table, lambda: self.navigate_grid(1))
         
+        content_layout.addWidget(self.table)
         main_layout.addWidget(content)
         
         # --- Refinement Dock (Bottom) ---
@@ -327,84 +435,173 @@ class MainWindow(QMainWindow):
         dock_widget = QWidget()
         dock_layout = QHBoxLayout(dock_widget)
         
-        # Source (Readonly)
-        v1 = QVBoxLayout()
-        v1.addWidget(QLabel("Source:"))
+        # Left: Source & Prompt
+        v_left = QVBoxLayout()
+        
+        h_src = QHBoxLayout()
+        h_src.addWidget(QLabel("Source Segment:"))
+        h_src.addStretch()
+        btn_copy_src = QPushButton("📋")
+        btn_copy_src.setFixedSize(24, 24)
+        btn_copy_src.setToolTip("Copy Source")
+        btn_copy_src.clicked.connect(lambda: QApplication.clipboard().setText(self.txt_source.toPlainText()))
+        h_src.addWidget(btn_copy_src)
+        v_left.addLayout(h_src)
+        
         self.txt_source = QTextEdit()
         self.txt_source.setReadOnly(True)
-        self.txt_source.setMaximumHeight(100)
-        v1.addWidget(self.txt_source)
-        dock_layout.addLayout(v1, 1)
+        self.txt_source.setMinimumHeight(60)
+        v_left.addWidget(self.txt_source)
         
-        # Prompt & Action
-        v2 = QVBoxLayout()
-        v2.addWidget(QLabel("Custom Instruction:"))
+        v_left.addWidget(QLabel("Instruction:"))
+        h_actions = QHBoxLayout()
+        self.txt_prompt = QLineEdit()
+        self.txt_prompt.setPlaceholderText("e.g. 'Fix grammar', 'Make concise'")
+        self.txt_prompt.returnPressed.connect(self.refine_current_segment) # Enter to trigger
+        h_actions.addWidget(self.txt_prompt)
+        
+        self.btn_refine = QPushButton("✨ Refine")
+        self.btn_refine.clicked.connect(self.refine_current_segment)
+        h_actions.addWidget(self.btn_refine)
+        v_left.addLayout(h_actions)
         
         # Shortcuts
-        h_shortcuts = QHBoxLayout()
-        btn_s1 = QPushButton("Formal")
-        btn_s1.clicked.connect(lambda: self.txt_prompt.setText("Make it more formal"))
-        h_shortcuts.addWidget(btn_s1)
+        h_quick = QHBoxLayout()
+        for label, prompt in [("Formal", "Make it formal"), ("Concise", "Make it concise"), ("Fix Grammar", "Fix grammar errors")]:
+            btn = QPushButton(label)
+            btn.clicked.connect(lambda _, p=prompt: (self.txt_prompt.setText(p), self.refine_current_segment()))
+            h_quick.addWidget(btn)
+        h_quick.addStretch()
+        v_left.addLayout(h_quick)
         
-        btn_s2 = QPushButton("Concise")
-        btn_s2.clicked.connect(lambda: self.txt_prompt.setText("Make it concise"))
-        h_shortcuts.addWidget(btn_s2)
+        dock_layout.addLayout(v_left, 1)
+
+        # Right: Target & Diff
+        v_right = QVBoxLayout()
+        v_right.addWidget(QLabel("Translation (Preview/Diff):"))
         
-        btn_s3 = QPushButton("Fix Grammar")
-        btn_s3.clicked.connect(lambda: self.txt_prompt.setText("Fix grammar errors"))
-        h_shortcuts.addWidget(btn_s3)
-        v2.addLayout(h_shortcuts)
+        # Splitter for Diff and Edit to allow resizing
+        splitter_right = QSplitter(Qt.Orientation.Vertical)
         
-        self.txt_prompt = QLineEdit()
-        self.txt_prompt.setPlaceholderText("e.g. 'Use specific terminology'")
-        v2.addWidget(self.txt_prompt)
+        self.txt_diff = QTextEdit()
+        self.txt_diff.setReadOnly(True)
+        self.txt_diff.setMinimumHeight(40)
+        self.txt_diff.setPlaceholderText("Diff view will appear here...")
+        splitter_right.addWidget(self.txt_diff)
         
-        self.btn_refine = QPushButton("✨ Refine Segment")
-        self.btn_refine.clicked.connect(self.refine_current_segment)
-        v2.addWidget(self.btn_refine)
-        v2.addStretch()
-        dock_layout.addLayout(v2, 1)
+        self.txt_target_edit = QTextEdit() # Editable
+        self.txt_target_edit.setMinimumHeight(60)
+        splitter_right.addWidget(self.txt_target_edit)
         
-        # Target (Result Preview/Edit)
-        v3 = QVBoxLayout()
-        v3.addWidget(QLabel("Translation:"))
-        self.txt_target = QTextEdit()
-        self.txt_target.setMaximumHeight(100)
-        v3.addWidget(self.txt_target)
-        dock_layout.addLayout(v3, 1)
+        # Set initial sizes
+        splitter_right.setSizes([60, 100])
+        
+        v_right.addWidget(splitter_right)
+        
+        h_confirm = QHBoxLayout()
+        h_confirm.addStretch()
+        self.btn_apply = QPushButton("✅ Apply & Next (Ctrl+Enter)")
+        self.btn_apply.clicked.connect(self.apply_refinement)
+        self.btn_apply.setObjectName("btnPrimary")
+        QShortcut(QKeySequence("Ctrl+Return"), self, self.apply_refinement)
+        
+        h_confirm.addWidget(self.btn_apply)
+        v_right.addLayout(h_confirm)
+        
+        dock_layout.addLayout(v_right, 1)
         
         self.dock_refine.setWidget(dock_widget)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.dock_refine)
-        self.dock_refine.setVisible(False) # Hide initially
+        self.dock_refine.setVisible(False)
 
-    def apply_styles(self):
-        # Custom tweaks on top of qdarktheme
-        self.setStyleSheet("""
-            QLabel#appTitle { font-size: 24px; font-weight: bold; color: #60CDFF; margin-bottom: 20px; }
-            QPushButton { padding: 6px; border-radius: 4px; }
-            QPushButton#btnPrimary { background-color: #007AFF; color: white; font-weight: bold; padding: 10px; }
-            QPushButton#btnPrimary:hover { background-color: #0062CC; }
-            QFrame#sidebar { background-color: #202124; border-right: 1px solid #3C4043; }
+    def toggle_theme(self):
+        # Toggle between 'auto' (usually dark on this OS) and 'light'
+        current = self.settings.value("theme", "dark")
+        new_theme = "light" if current == "dark" else "dark"
+        qdarktheme.setup_theme(new_theme)
+        self.settings.setValue("theme", new_theme)
+        self.apply_styles(new_theme) # Re-apply styles with new theme colors
+
+    def apply_styles(self, theme="dark"):
+        # Custom tweaks based on theme
+        
+        if theme == "dark":
+            bg_sidebar = "#202124"
+            bg_filter = "#2D2F31"
+            border_col = "#3C4043"
+            text_col = "#E8EAED"
+            primary_col = "#007AFF"
+            title_col = "#60CDFF"
+        else:
+            bg_sidebar = "#F1F3F4" # Light gray
+            bg_filter = "#FFFFFF"
+            border_col = "#DADCE0"
+            text_col = "#202124"
+            primary_col = "#1A73E8"
+            title_col = "#1967D2"
+
+        self.setStyleSheet(f"""
+            QLabel#appTitle {{ font-size: 24px; font-weight: bold; color: {title_col}; margin-bottom: 20px; }}
+            QPushButton {{ padding: 6px; border-radius: 4px; }}
+            QPushButton#btnPrimary {{ background-color: {primary_col}; color: white; font-weight: bold; padding: 10px; }}
+            QPushButton#btnPrimary:hover {{ opacity: 0.9; }}
+            QFrame#sidebar {{ background-color: {bg_sidebar}; border-right: 1px solid {border_col}; }}
+            QFrame#filterBar {{ background-color: {bg_filter}; border-bottom: 1px solid {border_col}; border-radius: 4px; }}
+            QTextEdit {{ font-family: Consolas, monospace; font-size: 13px; }}
         """)
+        
+        # Update button text
+        self.btn_theme.setText("🌞 Light Mode" if theme == "dark" else "🌙 Dark Mode")
 
-    # --- Logic ---
-
+    # --- Settings persistence ---
+    def load_settings(self):
+        try:
+            self.combo_src.setCurrentText(self.settings.value("source_lang", "zh-CN"))
+            self.combo_tgt.setCurrentText(self.settings.value("target_lang", "en"))
+            self.combo_provider.setCurrentText(self.settings.value("provider", "SiliconFlow"))
+            self.txt_apikey.setText(self.settings.value("api_key", ""))
+            self.txt_model.setText(self.settings.value("model", ""))
+            self.txt_base_url.setText(self.settings.value("base_url", ""))
+            
+            # Geometry
+            geo = self.settings.value("geometry")
+            if geo: self.restoreGeometry(geo)
+            
+            # Theme
+            theme = self.settings.value("theme", "dark")
+            qdarktheme.setup_theme(theme)
+            self.apply_styles(theme) # Apply correct custom styles
+            
+            # Trigger provider update logic to set defaults if empty
+            self.on_provider_changed(self.combo_provider.currentText())
+            
+        except Exception as e:
+            print(f"Error loading settings: {e}")
+            
+    # Remove Provider Logic for Mock if necessary
+    def on_provider_changed(self, text):
+        presets = {
+            "SiliconFlow": ("https://api.siliconflow.cn/v1", "deepseek-ai/DeepSeek-V2.5"),
+            "OpenAI": ("https://api.openai.com/v1", "gpt-4o"),
+            "DeepSeek": ("https://api.deepseek.com", "deepseek-chat"),
+        }
+        
+        url, model = presets.get(text, ("", ""))
+        if url and not self.txt_base_url.text():
+            self.txt_base_url.setText(url)
+        if model and not self.txt_model.text():
+            self.txt_model.setText(model)
+            
     def get_client(self):
         prov = self.combo_provider.currentText()
         key = self.txt_apikey.text()
+        base = self.txt_base_url.text()
         model = self.txt_model.text()
         
-        prov_map = {"SiliconFlow": "custom", "OpenAI": "custom", "DeepSeek": "custom", "Mock": "mock"}
-        base_urls = {
-            "SiliconFlow": "https://api.siliconflow.cn/v1",
-            "OpenAI": "https://api.openai.com/v1",
-            "DeepSeek": "https://api.deepseek.com"
-        }
-        
-        if not key and prov != "Mock":
+        if not key:
             raise ValueError("API Key required")
             
-        return LLMClient(api_key=key, base_url=base_urls.get(prov), model=model, provider=prov_map[prov])
+        return LLMClient(api_key=key, base_url=base, model=model, provider="custom")
 
     def test_connection(self):
         try:
@@ -415,18 +612,13 @@ class MainWindow(QMainWindow):
             
         self.btn_test_conn.setEnabled(False)
         self.btn_test_conn.setText("Testing...")
-        
         self.test_worker = TestConnectionWorker(client)
-        self.test_worker.finished.connect(self.on_test_finished)
+        self.test_worker.finished.connect(lambda s, m: (
+            self.btn_test_conn.setEnabled(True),
+            self.btn_test_conn.setText("📡 Test Connection"),
+            QMessageBox.information(self, "Result", m) if s else QMessageBox.critical(self, "Error", m)
+        ))
         self.test_worker.start()
-        
-    def on_test_finished(self, success, msg):
-        self.btn_test_conn.setEnabled(True)
-        self.btn_test_conn.setText("📡 Test Connection")
-        if success:
-            QMessageBox.information(self, "Success", msg)
-        else:
-            QMessageBox.critical(self, "Failed", msg)
 
     def open_file(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open XLIFF", "", "XLIFF (*.xlf *.xliff)")
@@ -443,6 +635,7 @@ class MainWindow(QMainWindow):
                     self.units.append(u)
                 
                 self.model.update_data(self.units)
+                self.proxy_model.invalidate()
                 self.update_stats()
             except Exception as e:
                 QMessageBox.critical(self, "Error", str(e))
@@ -450,11 +643,24 @@ class MainWindow(QMainWindow):
     def update_stats(self):
         total = len(self.units)
         done = sum(1 for u in self.units if u.target_abstracted)
-        locked = sum(1 for u in self.units if u.state == 'locked')
-        self.lbl_stats.setText(f"Total: {total} | Translated: {done} | Locked: {locked}")
+        self.lbl_stats.setText(f"Total: {total} | Translated: {done}")
 
-    def start_translation(self):
-        if not self.units: return
+    def on_search_changed(self, text):
+        self.proxy_model.set_text_filter(text)
+        
+    def on_filter_btn_clicked(self, name):
+        # Uncheck others
+        for btn in self.btn_grp_filter:
+            if btn.text() != name: btn.setChecked(False)
+        self.proxy_model.set_status_filter(name)
+
+    def start_translation(self, target_units=None):
+        # target_units: list of units to translate. If None, translate all (except locked).
+        if target_units is None:
+            target_units = self.units
+            
+        if not target_units: return
+        
         try:
             client = self.get_client()
         except Exception as e:
@@ -465,10 +671,7 @@ class MainWindow(QMainWindow):
         self.progress.setVisible(True)
         self.progress.setValue(0)
         
-        src_lang = self.combo_src.currentText()
-        tgt_lang = self.combo_tgt.currentText()
-        
-        self.trans_worker = TranslationWorker(self.units, client, src_lang, tgt_lang)
+        self.trans_worker = TranslationWorker(target_units, client, self.combo_src.currentText(), self.combo_tgt.currentText())
         self.trans_worker.progress.connect(lambda c, t: self.progress.setValue(int(c/t*100)))
         self.trans_worker.finished.connect(self.on_trans_finished)
         self.trans_worker.error.connect(lambda e: QMessageBox.critical(self, "Error", e))
@@ -477,103 +680,177 @@ class MainWindow(QMainWindow):
     def on_trans_finished(self):
         self.btn_trans.setEnabled(True)
         self.progress.setVisible(False)
-        self.model.layoutChanged.emit() # Refresh table
+        self.model.layoutChanged.emit() # Force refresh
         self.update_stats()
-        QMessageBox.information(self, "Done", "Batch translation complete!")
+        QMessageBox.information(self, "Done", "Translation complete!")
 
     def on_selection_changed(self, selected, deselected):
         indexes = self.table.selectionModel().selectedRows()
         if len(indexes) == 1:
-            self.active_unit_index = indexes[0].row()
-            unit = self.units[self.active_unit_index]
+            # Get model index from proxy
+            proxy_idx = indexes[0]
+            source_idx = self.proxy_model.mapToSource(proxy_idx)
+            self.active_unit_index_map = source_idx.row()
+            
+            unit = self.units[self.active_unit_index_map]
             
             self.dock_refine.setVisible(True)
             self.txt_source.setText(unit.source_abstracted)
-            self.txt_target.setText(unit.target_abstracted or "")
+            self.txt_target_edit.setPlainText(unit.target_abstracted or "")
+            self.txt_diff.clear() # Clear specific Diff
             self.txt_prompt.clear()
         else:
             self.dock_refine.setVisible(False)
-            self.active_unit_index = -1
+            self.active_unit_index_map = -1
+
+    def grid_navigate(self, delta):
+        # Implementation for Ctrl+Up/Down
+        pass 
+
+    def navigate_grid(self, delta):
+        idx = self.table.currentIndex()
+        if idx.isValid():
+            new_row = idx.row() + delta
+            if 0 <= new_row < self.proxy_model.rowCount():
+                new_idx = self.proxy_model.index(new_row, 0)
+                self.table.setCurrentIndex(new_idx)
+                self.table.selectRow(new_row)
 
     def refine_current_segment(self):
-        if self.active_unit_index < 0: return
+        if self.active_unit_index_map < 0: return
         
-        unit = self.units[self.active_unit_index]
+        unit = self.units[self.active_unit_index_map]
         instruction = self.txt_prompt.text()
-        if not instruction: 
-            QMessageBox.warning(self, "Info", "Please enter an instruction")
-            return
+        if not instruction: return
             
         try:
             client = self.get_client()
-        except Exception as e:
-            QMessageBox.warning(self, "Config Error", str(e))
-            return
+        except: return
             
         self.btn_refine.setEnabled(False)
         self.btn_refine.setText("Refining...")
         
-        self.refine_worker = RefineWorker(client, unit.source_abstracted, unit.target_abstracted, instruction)
+        # We refine based on abstract source and CURRENT EDIT state in box
+        current_val = self.txt_target_edit.toPlainText()
+        
+        self.refine_worker = RefineWorker(client, unit.source_abstracted, current_val, instruction)
         self.refine_worker.finished.connect(self.on_refine_finished)
         self.refine_worker.start()
 
     def on_refine_finished(self, new_text):
-        if self.active_unit_index >= 0:
-            unit = self.units[self.active_unit_index]
+        old_text = self.txt_target_edit.toPlainText()
+        
+        # Show diff
+        # d = difflib.HtmlDiff(wrapcolumn=40)
+        
+        # Update Edit box
+        self.txt_target_edit.setPlainText(new_text)
+        
+        # Render simple Diff string (Red/Green)
+        diff_html = self.generate_diff_html(old_text, new_text)
+        self.txt_diff.setHtml(diff_html)
+        
+        self.btn_refine.setEnabled(True)
+        self.btn_refine.setText("✨ Refine")
+        self.txt_prompt.clear()
+
+    def generate_diff_html(self, old, new):
+        # Simple word-based diff
+        seq = difflib.SequenceMatcher(None, old, new)
+        html = []
+        for tag, i1, i2, j1, j2 in seq.get_opcodes():
+            if tag == 'replace':
+                html.append(f"<span style='background-color:#ffcccc; text-decoration:line-through'>{old[i1:i2]}</span>")
+                html.append(f"<span style='background-color:#ccffcc'>{new[j1:j2]}</span>")
+            elif tag == 'delete':
+                html.append(f"<span style='background-color:#ffcccc; text-decoration:line-through'>{old[i1:i2]}</span>")
+            elif tag == 'insert':
+                html.append(f"<span style='background-color:#ccffcc'>{new[j1:j2]}</span>")
+            elif tag == 'equal':
+                html.append(old[i1:i2])
+        return "".join(html).replace("\n", "<br>")
+
+    def apply_refinement(self):
+        # Save text from edit box to model
+        if self.active_unit_index_map < 0: return
+        
+        new_text = self.txt_target_edit.toPlainText()
+        unit = self.units[self.active_unit_index_map]
+        
+        if unit.target_abstracted != new_text:
             unit.target_abstracted = new_text
             unit.state = "edited"
-            self.model.refresh_row(self.active_unit_index)
-            self.txt_target.setText(new_text)
+            self.model.refresh_row(self.active_unit_index_map)
             self.update_stats()
             
-        self.btn_refine.setEnabled(True)
-        self.btn_refine.setText("✨ Refine Segment")
+        # Move next
+        self.navigate_grid(1)
 
     def show_context_menu(self, pos):
-        menu = QMenu()
-        act_lock = menu.addAction("🔒 Lock Selected")
-        act_unlock = menu.addAction("🔓 Unlock Selected")
-        menu.addSeparator()
-        act_copy = menu.addAction("📄 Copy Source")
+        # Get selected proxied indexes
+        proxy_indexes = self.table.selectionModel().selectedRows()
+        if not proxy_indexes: return
         
+        # Map to source indexes
+        # We need actual Unit objects for actions
+        selected_units = []
+        for p_idx in proxy_indexes:
+            src_idx = self.proxy_model.mapToSource(p_idx)
+            selected_units.append(self.units[src_idx.row()]) # Store reference
+
+        menu = QMenu()
+        
+        # Translate Action
+        action_translate = menu.addAction(f"🚀 Translate Selected ({len(selected_units)})")
+        
+        menu.addSeparator()
+        
+        # Lock Action
+        action_lock = menu.addAction("🔒 Lock Selected")
+        action_unlock = menu.addAction("🔓 Unlock Selected")
+        
+        menu.addSeparator()
+        action_copy = menu.addAction("📄 Copy Source")
+        
+        # Execute
         action = menu.exec(self.table.viewport().mapToGlobal(pos))
         
-        indexes = self.table.selectionModel().selectedRows()
-        rows = [i.row() for i in indexes]
-        
-        if action == act_lock:
-            for r in rows:
-                self.units[r].state = "locked"
-                self.model.refresh_row(r)
-        elif action == act_unlock:
-            for r in rows:
-                u = self.units[r]
+        if action == action_translate:
+            self.start_translation(target_units=selected_units)
+            
+        elif action == action_lock:
+            for u in selected_units:
+                u.state = "locked"
+            self.model.layoutChanged.emit() # Refresh UI
+            self.update_stats()
+            
+        elif action == action_unlock:
+            for u in selected_units:
                 u.state = "edited" if u.target_abstracted else "needs_translation"
-                self.model.refresh_row(r)
-        elif action == act_copy:
-            if rows:
+            self.model.layoutChanged.emit()
+            self.update_stats()
+            
+        elif action == action_copy:
+            if selected_units:
                 clip = QApplication.clipboard()
-                clip.setText(self.units[rows[0]].source_abstracted)
-                
-        self.update_stats()
-
+                # Copy first or all? Usually first seems safer for clipboard
+                text = selected_units[0].source_abstracted
+                clip.setText(text)
+        
     def save_file(self):
-        if not self.units or not self.parser: return
+        if not self.units: return
         path, _ = QFileDialog.getSaveFileName(self, "Export", "", "XLIFF (*.xlf)")
         if path:
-            # Reconstruct
             for u in self.units:
                 if u.target_abstracted:
-                    try:
-                        u.target_raw = self.abstractor.reconstruct(u.target_abstracted, u.tags_map)
+                    try: u.target_raw = self.abstractor.reconstruct(u.target_abstracted, u.tags_map)
                     except: pass
             self.parser.update_targets(self.units, path)
-            QMessageBox.information(self, "Saved", f"File exported to {path}")
+            QMessageBox.information(self, "Saved", f"Exported to {path}")
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    qdarktheme.setup_theme() # Auto dark/light mode
-    
+    qdarktheme.setup_theme()
     w = MainWindow()
     w.show()
     sys.exit(app.exec())

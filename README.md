@@ -48,15 +48,14 @@ If you have downloaded the `.exe` version:
 *   `desktop_app.py`: Main entry point for the GUI application.
 *   `core/`: Contains logic for XLIFF parsing and tag handling.
 *   `ai/`: Contains the LLM client wrapper.
-*   `main.py`: A command-line interface (CLI) version of the tool.
 
 ### Building the Executable
 
-To build a standalone `.exe` file:
+To build a standalone `.exe` file using the included spec file:
 
 ```bash
 pip install pyinstaller
-python -m PyInstaller --noconsole --onefile --name="XLIFF_AI_Assistant" --clean desktop_app.py
+pyinstaller XLIFF_AI_Assistant.spec
 ```
 
 The output file will be in the `dist/` folder.
