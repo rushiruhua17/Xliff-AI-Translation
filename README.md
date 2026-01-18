@@ -1,76 +1,66 @@
-# XLIFF AI Assistant (傻瓜式运行指南)
+# XLIFF AI Assistant
 
-这是一个利用 AI 帮助翻译 XLIFF 文件（memoQ/Trados 导出格式）的工具。它能保护文件中的格式标签，防止 AI 破坏文件结构。
+XLIFF AI Assistant is a professional desktop tool designed to help translators work with XLIFF files more efficiently using AI.
 
----
+It combines the structure of standard CAT (Computer-Assisted Translation) tools with the power of Large Language Models (LLMs).
 
-## 🚀 第一次安装 (只需要做一次)
+## Features
 
-### 1. 安装环境依赖
-确保你已经安装了 Python 和 Node.js。
+*   **Desktop Application**: Built with Python and PyQt6 for a fast, native experience.
+*   **Tag Protection**: Intelligently abstracts XML tags (e.g., `<bpt id="1">`) to prevent AI from messing up the file structure.
+*   **AI Integration**: Supports OpenAI, SiliconFlow, DeepSeek, and more.
+*   **Interactive Refinement**: Select any segment and ask AI to "Make it shorter", "Fix grammar", or any custom instruction.
+*   **Batch Processing**: Translate thousands of segments automatically.
 
-### 2. 初始化项目
-打开命令行 (PowerShell 或 CMD)，复制以下命令并回车：
+## Installation
 
-```powershell
-# 进入项目目录 (如果你还没在里面)
-cd .gemini\antigravity\scratch\xliff_ai_assistant
+1.  **Clone the repository**:
+    ```bash
+    git clone https://github.com/your-username/xliff-ai-assistant.git
+    cd xliff-ai-assistant
+    ```
 
-# 1. 安装 Python 后端库
-pip install lxml fastapi uvicorn python-multipart
+2.  **Install dependencies**:
+    ```bash
+    pip install -r requirements.txt
+    ```
 
-# 2. 安装前端库
-cd web
-npm install
-cd ..
+## Usage
+
+### Option 1: Run from Source (Recommended for Developers)
+
+Simply run the Python script:
+
+```bash
+python desktop_app.py
 ```
 
----
+### Option 2: Run the Executable (Recommended for Users)
 
-## ▶️ 怎么运行 (每次使用时)
+If you have downloaded the `.exe` version:
+1.  Double-click `XLIFF_AI_Assistant.exe`.
+2.  No Python installation required.
 
-你需要打开 **两个** 黑色命令行窗口。
+## Development Guide
 
-### 第 1 个窗口：启动后端服务 (Backend)
+### Project Structure
 
-复制粘贴：
-```powershell
-cd .gemini\antigravity\scratch\xliff_ai_assistant
-python server/app.py
+*   `desktop_app.py`: Main entry point for the GUI application.
+*   `core/`: Contains logic for XLIFF parsing and tag handling.
+*   `ai/`: Contains the LLM client wrapper.
+*   `main.py`: A command-line interface (CLI) version of the tool.
+
+### Building the Executable
+
+To build a standalone `.exe` file:
+
+```bash
+pip install pyinstaller
+python -m PyInstaller --noconsole --onefile --name="XLIFF_AI_Assistant" --clean desktop_app.py
 ```
-*当看到 `Uvicorn running on http://0.0.0.0:8000` 时，说明后端启动成功。**不要关闭这个窗口**。*
 
-### 第 2 个窗口：启动网页界面 (Frontend)
+The output file will be in the `dist/` folder.
 
-复制粘贴：
-```powershell
-cd .gemini\antigravity\scratch\xliff_ai_assistant\web
-npm run dev
-```
-*当看到 `Local: http://localhost:5173` 时，说明前端启动成功。*
+## License
 
----
-
-## 🌐 开始使用
-
-打开浏览器 (Chrome/Edge)，访问：
-**[http://localhost:5173](http://localhost:5173)**
-
-1.  把你的 `.xlf` 文件拖进去。
-2.  点击 **"Translate All"** 等待 AI 翻译。
-3.  翻译完后，点击 **"Export XLIFF"** 下载文件。
-4.  把下载的文件导回 memoQ/Trados 即可。
-
----
-
-## 🛠️ 常见问题
-
-**Q: 运行 `python server/app.py` 报错找不到文件？**
-A: 请确保你先执行了 `cd` 命令进入了正确的文件夹。看上面的路径。
-
-**Q: 网页打不开？**
-A: 请检查两个黑色窗口是不是都开着，并且没有报错。
-
-**Q: 翻译是假的？**
-A: 目前使用的是演示模式 (Mock AI)，为了省钱不消耗 Token。它会把原文复制并在前面加 `[Zh]`。
-如果要接入真实 AI，请联系开发修改 `ai/client.py`。
+MIT
