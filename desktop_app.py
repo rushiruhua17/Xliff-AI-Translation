@@ -2,13 +2,14 @@ import sys
 import os
 import time
 import difflib
+import re # Native regex for stability
 import qdarktheme # Modern theme
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QTableView, QFileDialog, 
                              QHeaderView, QMessageBox, QLabel, QAbstractItemView,
                              QComboBox, QLineEdit, QGroupBox, QMenu, QDockWidget,
                              QTextEdit, QProgressBar, QSplitter, QFrame, QCheckBox,
-                             QToolBar, QSpacerItem, QSizePolicy)
+                             QToolBar, QSpacerItem, QSizePolicy, QTabWidget)
 from PyQt6.QtCore import (Qt, QAbstractTableModel, QModelIndex, QThread, pyqtSignal, 
                           QSize, QSettings, QSortFilterProxyModel, QRegularExpression)
 from PyQt6.QtGui import QAction, QIcon, QColor, QBrush, QKeySequence, QShortcut
@@ -108,7 +109,7 @@ class XliffTableModel(QAbstractTableModel):
     def __init__(self, units=None):
         super().__init__()
         self.units = units or []
-        self.headers = ["ID", "State", "Source", "Target"]
+        self.headers = ["ID", "State", "Tags", "QA", "Source", "Target"]
 
     def rowCount(self, parent=QModelIndex()):
         return len(self.units)
@@ -132,8 +133,14 @@ class XliffTableModel(QAbstractTableModel):
                 elif unit.state == "edited": return "✏️"
                 elif unit.state == "needs_translation": return "⚪"
                 return "⚪"
-            elif col == 2: return unit.source_abstracted
-            elif col == 3: return unit.target_abstracted
+            elif col == 2: return unit.tag_stats
+            elif col == 3:
+                # QA Status
+                if unit.qa_status == "error": return "⛔"
+                elif unit.qa_status == "warning": return "⚠️"
+                else: return "✅"
+            elif col == 4: return unit.source_abstracted
+            elif col == 5: return unit.target_abstracted
             
         elif role == Qt.ItemDataRole.DecorationRole and col == 1:
             return None # We use DisplayRole for Emojis now
@@ -155,14 +162,14 @@ class XliffTableModel(QAbstractTableModel):
         flags = super().flags(index)
         unit = self.units[index.row()]
         
-        if index.column() == 3:
+        if index.column() == 5:
             if unit.state != "locked":
                 flags |= Qt.ItemFlag.ItemIsEditable
         
         return flags
 
     def setData(self, index, value, role=Qt.ItemDataRole.EditRole):
-        if index.isValid() and role == Qt.ItemDataRole.EditRole and index.column() == 3:
+        if index.isValid() and role == Qt.ItemDataRole.EditRole and index.column() == 5:
             unit = self.units[index.row()]
             if unit.state == "locked": return False
             
@@ -266,178 +273,26 @@ class MainWindow(QMainWindow):
         self.apply_styles()
 
     def setup_ui(self):
-        # Central Widget
-        central = QWidget()
-        self.setCentralWidget(central)
-        main_layout = QHBoxLayout(central)
-        main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.setSpacing(0)
+        # Central Widget is now a TabWidget
+        self.tabs = QTabWidget()
+        self.setCentralWidget(self.tabs)
         
-        # --- Sidebar ---
-        sidebar = QFrame()
-        sidebar.setFixedWidth(300)
-        sidebar.setObjectName("sidebar") 
-        side_layout = QVBoxLayout(sidebar)
-        side_layout.setContentsMargins(15, 15, 15, 15)
+        # --- Tab 1: Translate (Workbench) ---
+        self.tab_translate = QWidget()
+        self.setup_translate_tab()
+        self.tabs.addTab(self.tab_translate, "Worktable")
         
-        # Title
-        lbl_title = QLabel("XLIFF\nAssistant")
-        lbl_title.setObjectName("appTitle")
-        lbl_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        side_layout.addWidget(lbl_title)
-        side_layout.addSpacing(10)
-        
-        # Language Config
-        grp_lang = QGroupBox("Language")
-        l_lang = QVBoxLayout()
-        l_lang.addWidget(QLabel("Source:"))
-        self.combo_src = QComboBox()
-        self.combo_src.addItems(["en", "zh-CN", "fr", "de", "ja", "ko"])
-        l_lang.addWidget(self.combo_src)
-        
-        l_lang.addWidget(QLabel("Target:"))
-        self.combo_tgt = QComboBox()
-        self.combo_tgt.addItems(["en", "zh-CN", "fr", "de", "ja", "ko"])
-        l_lang.addWidget(self.combo_tgt)
-        grp_lang.setLayout(l_lang)
-        side_layout.addWidget(grp_lang)
+        # --- Tab 2: Settings ---
+        self.tab_settings = QWidget()
+        self.setup_settings_tab()
+        self.tabs.addTab(self.tab_settings, "Settings")
 
-        # AI Config
-        grp_ai = QGroupBox("AI Configuration")
-        l_ai = QVBoxLayout()
-        
-        self.combo_provider = QComboBox()
-        self.combo_provider.addItems(["SiliconFlow", "OpenAI", "DeepSeek"])
-        self.combo_provider.currentTextChanged.connect(self.on_provider_changed)
-        l_ai.addWidget(QLabel("Provider:"))
-        l_ai.addWidget(self.combo_provider)
-        
-        self.txt_apikey = QLineEdit()
-        self.txt_apikey.setPlaceholderText("sk-...")
-        self.txt_apikey.setEchoMode(QLineEdit.EchoMode.Password)
-        l_ai.addWidget(QLabel("API Key:"))
-        l_ai.addWidget(self.txt_apikey)
-        
-        # Base URL (conditionally shown or just integrated)
-        self.txt_base_url = QLineEdit()
-        self.txt_base_url.setPlaceholderText("https://...")
-        self.txt_base_url.setToolTip("Custom Base URL")
-        l_ai.addWidget(QLabel("Base URL:"))
-        l_ai.addWidget(self.txt_base_url)
-        
-        self.txt_model = QLineEdit()
-        l_ai.addWidget(QLabel("Model:"))
-        l_ai.addWidget(self.txt_model)
-        
-        self.btn_test_conn = QPushButton("📡 Test Connection")
-        self.btn_test_conn.clicked.connect(self.test_connection)
-        l_ai.addWidget(self.btn_test_conn)
-        
-        grp_ai.setLayout(l_ai)
-        side_layout.addWidget(grp_ai)
-        
-        side_layout.addStretch()
-        
-        # Action Buttons
-        button_layout = QVBoxLayout()
-        button_layout.setSpacing(10)
-        
-        self.btn_open = QPushButton("📂 Open File")
-        self.btn_open.clicked.connect(self.open_file)
-        button_layout.addWidget(self.btn_open)
-        
-        self.btn_trans = QPushButton("🚀 Start Translation")
-        self.btn_trans.clicked.connect(self.start_translation)
-        self.btn_trans.setObjectName("btnPrimary")
-        button_layout.addWidget(self.btn_trans)
-        
-        self.btn_save = QPushButton("💾 Export Result")
-        self.btn_save.clicked.connect(self.save_file)
-        button_layout.addWidget(self.btn_save)
-        
-        # Theme Toggle
-        self.btn_theme = QPushButton("🌓 Switch Theme")
-        self.btn_theme.clicked.connect(self.toggle_theme)
-        button_layout.addWidget(self.btn_theme)
-        
-        side_layout.addLayout(button_layout)
-        main_layout.addWidget(sidebar)
-        
-        # --- Content Area ---
-        content = QWidget()
-        content_layout = QVBoxLayout(content)
-        content_layout.setContentsMargins(10, 10, 10, 10)
-        
-        # 1. Stats Bar
-        stats_layout = QHBoxLayout()
-        self.lbl_stats = QLabel("No file loaded.")
-        stats_layout.addWidget(self.lbl_stats)
-        
-        self.progress = QProgressBar()
-        self.progress.setVisible(False)
-        self.progress.setFixedWidth(200)
-        stats_layout.addStretch()
-        stats_layout.addWidget(self.progress)
-        content_layout.addLayout(stats_layout)
-        
-        # 2. Advanced Filter Bar
-        filter_frame = QFrame()
-        filter_frame.setObjectName("filterBar") # Apply strict styling
-        filter_layout = QHBoxLayout(filter_frame)
-        filter_layout.setContentsMargins(5, 5, 5, 5)
-        
-        filter_layout.addWidget(QLabel("🔍"))
-        self.txt_search = QLineEdit()
-        self.txt_search.setPlaceholderText("Search source or target...")
-        self.txt_search.textChanged.connect(self.on_search_changed)
-        filter_layout.addWidget(self.txt_search)
-        
-        filter_layout.addSpacing(20)
-        filter_layout.addWidget(QLabel("Filter:"))
-        
-        self.btn_grp_filter = []
-        for name in ["All", "Untranslated", "Translated", "Edited", "Locked"]:
-            btn = QPushButton(name)
-            btn.setCheckable(True)
-            if name == "All": btn.setChecked(True)
-            # Exclusive check using simple logic or QButtonGroup (skipping QButtonGroup for explicit logic)
-            btn.clicked.connect(lambda checked, n=name: self.on_filter_btn_clicked(n))
-            filter_layout.addWidget(btn)
-            self.btn_grp_filter.append(btn)
-            
-        filter_layout.addStretch()
-        content_layout.addWidget(filter_frame)
-
-        # 3. Table
-        self.table = QTableView()
-        self.table.setModel(self.proxy_model) 
-        self.table.setSortingEnabled(True)
-        
-        # Table Config
-        h = self.table.horizontalHeader()
-        h.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents) # ID
-        h.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents) # State
-        h.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch) # Source
-        h.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch) # Target
-        
-        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.table.customContextMenuRequested.connect(self.show_context_menu)
-        self.table.selectionModel().selectionChanged.connect(self.on_selection_changed)
-        
-        # Shortcuts
-        QShortcut(QKeySequence("Ctrl+Up"), self.table, lambda: self.navigate_grid(-1))
-        QShortcut(QKeySequence("Ctrl+Down"), self.table, lambda: self.navigate_grid(1))
-        
-        content_layout.addWidget(self.table)
-        main_layout.addWidget(content)
-        
-        # --- Refinement Dock (Bottom) ---
-        self.dock_refine = QDockWidget("✨ AI Refinement Workbench", self)
-        self.dock_refine.setAllowedAreas(Qt.DockWidgetArea.BottomDockWidgetArea)
+        # --- Refinement Dock (Right Drawer) ---
+        self.dock_refine = QDockWidget("✨ Workbench", self)
+        self.dock_refine.setAllowedAreas(Qt.DockWidgetArea.RightDockWidgetArea)
         
         dock_widget = QWidget()
-        dock_layout = QHBoxLayout(dock_widget)
+        dock_layout = QVBoxLayout(dock_widget)
         
         # Left: Source & Prompt
         v_left = QVBoxLayout()
@@ -515,8 +370,163 @@ class MainWindow(QMainWindow):
         dock_layout.addLayout(v_right, 1)
         
         self.dock_refine.setWidget(dock_widget)
-        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.dock_refine)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.dock_refine)
         self.dock_refine.setVisible(False)
+
+    def setup_translate_tab(self):
+        layout = QVBoxLayout(self.tab_translate)
+        layout.setContentsMargins(10, 10, 10, 10)
+        
+        # Top Bar: File Actions & Stats
+        top_bar = QHBoxLayout()
+        
+        self.btn_open = QPushButton("📂 Open")
+        self.btn_open.clicked.connect(self.open_file)
+        top_bar.addWidget(self.btn_open)
+        
+        self.btn_save = QPushButton("💾 Export")
+        self.btn_save.clicked.connect(self.save_file)
+        top_bar.addWidget(self.btn_save)
+        
+        self.btn_trans = QPushButton("🚀 Translate All")
+        self.btn_trans.clicked.connect(lambda: self.start_translation())
+        top_bar.addWidget(self.btn_trans)
+
+        self.btn_qa = QPushButton("🛡️ Run QA")
+        self.btn_qa.clicked.connect(self.run_qa)
+        top_bar.addWidget(self.btn_qa)
+        
+        top_bar.addSpacing(20)
+        self.lbl_stats = QLabel("No file loaded")
+        top_bar.addWidget(self.lbl_stats)
+        
+        top_bar.addStretch()
+        
+        # Theme Toggle (Small)
+        self.btn_theme = QPushButton("🌓")
+        self.btn_theme.setFixedSize(30, 30)
+        self.btn_theme.clicked.connect(self.toggle_theme)
+        top_bar.addWidget(self.btn_theme)
+        
+        layout.addLayout(top_bar)
+        
+        # Toolbar: Filter & Actions
+        toolbar = QHBoxLayout()
+        
+        # Search
+        self.txt_search = QLineEdit()
+        self.txt_search.setPlaceholderText("🔍 Search source/target...")
+        self.txt_search.textChanged.connect(self.on_search_changed)
+        toolbar.addWidget(self.txt_search, 1)
+        
+        # Filters
+        self.btn_grp_filter = []
+        for name in ["All", "Untranslated", "Translated", "Edited", "Locked"]:
+            btn = QPushButton(name)
+            btn.setCheckable(True)
+            if name == "All": btn.setChecked(True)
+            btn.clicked.connect(lambda checked, n=name: self.on_filter_btn_clicked(n))
+            toolbar.addWidget(btn)
+            self.btn_grp_filter.append(btn)
+            
+        layout.addLayout(toolbar)
+        
+        # Progress Bar
+        self.progress = QProgressBar()
+        self.progress.setVisible(False)
+        layout.addWidget(self.progress)
+
+        # Table
+        self.table = QTableView()
+        self.table.setModel(self.proxy_model) 
+        self.table.setSortingEnabled(True)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self.show_context_menu)
+        self.table.selectionModel().selectionChanged.connect(self.on_selection_changed)
+        
+        # Shortcuts
+        QShortcut(QKeySequence("Ctrl+Up"), self.table, lambda: self.navigate_grid(-1))
+        QShortcut(QKeySequence("Ctrl+Down"), self.table, lambda: self.navigate_grid(1))
+        
+        # Table Headers
+        h = self.table.horizontalHeader()
+        h.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents) # ID
+        h.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents) # State
+        h.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents) # Tags (New)
+        h.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents) # QA (New)
+        h.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch) # Source
+        h.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch) # Target
+        
+        layout.addWidget(self.table)
+
+    def setup_settings_tab(self):
+        layout = QVBoxLayout(self.tab_settings)
+        layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        layout.setSpacing(20)
+        layout.setContentsMargins(40, 40, 40, 40)
+        
+        # LLM Config Group
+        grp_llm = QGroupBox("AI Configuration")
+        form_layout = QVBoxLayout()
+        
+        # Provider
+        h_prov = QHBoxLayout()
+        h_prov.addWidget(QLabel("Provider:"))
+        self.combo_provider = QComboBox()
+        self.combo_provider.addItems(["SiliconFlow", "OpenAI", "DeepSeek"])
+        self.combo_provider.currentTextChanged.connect(self.on_provider_changed)
+        h_prov.addWidget(self.combo_provider)
+        form_layout.addLayout(h_prov)
+        
+        # API Key
+        h_key = QHBoxLayout()
+        h_key.addWidget(QLabel("API Key:"))
+        self.txt_apikey = QLineEdit()
+        self.txt_apikey.setEchoMode(QLineEdit.EchoMode.Password)
+        self.txt_apikey.setPlaceholderText("sk-...")
+        h_key.addWidget(self.txt_apikey)
+        form_layout.addLayout(h_key)
+        
+        # Base URL
+        h_url = QHBoxLayout()
+        h_url.addWidget(QLabel("Base URL:"))
+        self.txt_base_url = QLineEdit()
+        self.txt_base_url.setPlaceholderText("https://api.openai.com/v1")
+        h_url.addWidget(self.txt_base_url)
+        form_layout.addLayout(h_url)
+        
+        # Model
+        h_model = QHBoxLayout()
+        h_model.addWidget(QLabel("Model:"))
+        self.txt_model = QLineEdit()
+        self.txt_model.setPlaceholderText("gpt-3.5-turbo")
+        h_model.addWidget(self.txt_model)
+        form_layout.addLayout(h_model)
+        
+        # Test Connection HTML Warning
+        self.btn_test_conn = QPushButton("📡 Test Connection")
+        self.btn_test_conn.clicked.connect(self.test_connection)
+        form_layout.addWidget(self.btn_test_conn)
+
+        grp_llm.setLayout(form_layout)
+        layout.addWidget(grp_llm)
+        
+        # Language Config
+        grp_lang = QGroupBox("Language Defaults")
+        l_layout = QHBoxLayout()
+        self.combo_src = QComboBox()
+        self.combo_src.addItems(["zh-CN", "en", "ja", "de", "fr"])
+        self.combo_tgt = QComboBox()
+        self.combo_tgt.addItems(["en", "zh-CN", "ja", "de", "fr"])
+        l_layout.addWidget(QLabel("Source:"))
+        l_layout.addWidget(self.combo_src)
+        l_layout.addWidget(QLabel("Target:"))
+        l_layout.addWidget(self.combo_tgt)
+        grp_lang.setLayout(l_layout)
+        layout.addWidget(grp_lang)
+
+        layout.addStretch()
 
     def toggle_theme(self):
         # Toggle between 'auto' (usually dark on this OS) and 'light'
@@ -636,6 +646,13 @@ class MainWindow(QMainWindow):
                     res = self.abstractor.abstract(u.source_raw)
                     u.source_abstracted = res.abstracted_text
                     u.tags_map = res.tags_map
+                    
+                    if u.target_raw:
+                        # Attempt to abstract target as well for visualization
+                        # Note: This naively re-indexes tags. Complex re-ordering might mismatch IDs.
+                        res_tgt = self.abstractor.abstract(u.target_raw)
+                        u.target_abstracted = res_tgt.abstracted_text
+                    
                     self.units.append(u)
                 
                 self.model.update_data(self.units)
@@ -816,6 +833,7 @@ class MainWindow(QMainWindow):
         
         menu.addSeparator()
         action_copy = menu.addAction("📄 Copy Source")
+        action_clear = menu.addAction("🧹 Clear Target")
         
         # Execute
         action = menu.exec(self.table.viewport().mapToGlobal(pos))
@@ -841,9 +859,70 @@ class MainWindow(QMainWindow):
                 # Copy first or all? Usually first seems safer for clipboard
                 text = selected_units[0].source_abstracted
                 clip.setText(text)
+
+        elif action == action_clear:
+            for u in selected_units:
+                if u.state == "locked": continue
+                u.target_abstracted = ""
+                u.state = "needs_translation"
+            self.model.layoutChanged.emit()
+            self.update_stats()
         
+    def run_qa(self):
+        if not self.units: return
+        
+        # Use Python native re to avoid Qt Access Violations
+        pattern = re.compile(r"\{\d+\}")
+        error_count = 0
+        warning_count = 0
+        
+        for unit in self.units:
+            if unit.state == "locked": continue
+            
+            unit.errors = [] # Reset
+            
+            # 1. Tag Count Check
+            source_tag_count = len(unit.tags_map)
+            
+            # Count target tags in abstract string
+            # count matches of {n}
+            matches = pattern.findall(unit.target_abstracted or "")
+            target_tag_count = len(matches)
+            
+            unit.tag_stats = f"TAG: {target_tag_count}/{source_tag_count}"
+            
+            # 2. Logic
+            if target_tag_count != source_tag_count:
+                unit.qa_status = "error"
+                unit.errors.append("Tag quantity mismatch")
+                error_count += 1
+            elif not unit.target_abstracted and unit.state in ["translated", "edited"]:
+                unit.qa_status = "warning"
+                unit.errors.append("Empty translation")
+                warning_count += 1
+            else:
+                unit.qa_status = "ok"
+                
+        self.model.layoutChanged.emit() # Refresh UI (Icons)
+        
+        msg = f"QA Complete.\nErrors: {error_count}\nWarnings: {warning_count}"
+        if error_count > 0:
+            QMessageBox.warning(self, "QA Issues Found", msg + "\n\nPlease fix ERRORS before exporting.")
+        else:
+            QMessageBox.information(self, "QA Passed", msg)
+
     def save_file(self):
         if not self.units: return
+        
+        # Auto-run QA check before save
+        self.run_qa()
+        
+        # Check for blockers
+        errors = [u for u in self.units if u.qa_status == "error"]
+        if errors:
+            QMessageBox.critical(self, "Export Blocked", f"Found {len(errors)} Critical Errors (Tag Mismatch).\n\nYou must fix them to ensure valid XLIFF output.")
+            return
+
         path, _ = QFileDialog.getSaveFileName(self, "Export XLIFF", "", "XLIFF Files (*.xlf *.xliff);;All Files (*)")
         if path:
             for u in self.units:
@@ -857,6 +936,11 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Saved", f"Exported to {path}")
 
 if __name__ == "__main__":
+    import faulthandler
+    # Enable fault handler to catch hard crashes (segfaults)
+    sys.stderr = open("logs/crash_dump.txt", "w", encoding="utf-8")
+    faulthandler.enable(file=sys.stderr, all_threads=True)
+    
     setup_exception_hook()  # Install global crash logger
     app = QApplication(sys.argv)
     qdarktheme.setup_theme()
