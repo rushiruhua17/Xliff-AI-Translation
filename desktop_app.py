@@ -19,7 +19,11 @@ sys.path.append(current_dir)
 
 from core.parser import XliffParser
 from core.abstractor import TagAbstractor
+from core.logger import get_logger, setup_exception_hook
 from ai.client import LLMClient
+
+# Initialize logger for this module
+logger = get_logger(__name__)
 
 # --- Worker Threads ---
 
@@ -638,6 +642,7 @@ class MainWindow(QMainWindow):
                 self.proxy_model.invalidate()
                 self.update_stats()
             except Exception as e:
+                logger.error(f"Failed to open file: {e}", exc_info=True)
                 QMessageBox.critical(self, "Error", str(e))
 
     def update_stats(self):
@@ -839,18 +844,23 @@ class MainWindow(QMainWindow):
         
     def save_file(self):
         if not self.units: return
-        path, _ = QFileDialog.getSaveFileName(self, "Export", "", "XLIFF (*.xlf)")
+        path, _ = QFileDialog.getSaveFileName(self, "Export XLIFF", "", "XLIFF Files (*.xlf *.xliff);;All Files (*)")
         if path:
             for u in self.units:
                 if u.target_abstracted:
-                    try: u.target_raw = self.abstractor.reconstruct(u.target_abstracted, u.tags_map)
-                    except: pass
+                    try:
+                        u.target_raw = self.abstractor.reconstruct(u.target_abstracted, u.tags_map)
+                    except Exception as e:
+                        logger.warning(f"Tag reconstruction failed for unit {u.id}: {e}")
             self.parser.update_targets(self.units, path)
+            logger.info(f"File exported to: {path}")
             QMessageBox.information(self, "Saved", f"Exported to {path}")
 
 if __name__ == "__main__":
+    setup_exception_hook()  # Install global crash logger
     app = QApplication(sys.argv)
     qdarktheme.setup_theme()
+    logger.info("Application starting...")
     w = MainWindow()
     w.show()
     sys.exit(app.exec())

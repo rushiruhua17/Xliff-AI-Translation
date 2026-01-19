@@ -2,12 +2,14 @@ import os
 import time
 import json
 from typing import List, Dict, Any
-import logging
 
 try:
     from openai import OpenAI
 except ImportError:
     OpenAI = None
+
+from core.logger import get_logger
+logger = get_logger(__name__)
 
 class LLMClient:
     def __init__(self, api_key: str = None, base_url: str = None, model: str = "gpt-3.5-turbo", provider: str = "custom"):
@@ -21,13 +23,12 @@ class LLMClient:
             if OpenAI:
                 self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
             else:
-                logging.warning("OpenAI library not installed.")
+                logger.warning("OpenAI library not installed.")
 
     def translate_batch(self, segments: List[Dict[str, str]], source_lang: str, target_lang: str) -> List[Dict[str, str]]:
         if not self.client:
             # Fallback to mock if no client (or if key missing)
-            timestamp = time.strftime("%H:%M:%S")
-            print(f"[{timestamp}] No API Key provided, using Mock mode.")
+            logger.warning("No API Key provided, using Mock mode.")
             return self._mock_translate(segments)
 
         prompt = self.create_prompt(segments, source_lang, target_lang)
@@ -57,7 +58,7 @@ class LLMClient:
                 return list(data.values())[0] if data else []
 
         except Exception as e:
-            print(f"LLM Error: {e}")
+            logger.error(f"LLM Translation Error: {e}", exc_info=True)
             # Fallback to mock or empty on error to not crash UI
             return self._mock_translate(segments)
 
@@ -99,7 +100,7 @@ class LLMClient:
             )
             return response.choices[0].message.content.strip()
         except Exception as e:
-            print(f"Refine Error: {e}")
+            logger.error(f"Refine Error: {e}", exc_info=True)
             return current_target
 
     def create_prompt(self, segments: List[Dict[str, str]], source_lang: str, target_lang: str) -> str:

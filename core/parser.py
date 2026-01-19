@@ -2,6 +2,9 @@ from lxml import etree
 from typing import List, Optional
 import os
 from .xliff_obj import TranslationUnit
+from .logger import get_logger
+
+logger = get_logger(__name__)
 
 class XliffParser:
     def __init__(self, file_path: str):
@@ -104,7 +107,7 @@ class XliffParser:
                             target_node.set('state', "translated") # Force translated state for now or use valid state
                             
                     except etree.XMLSyntaxError as e:
-                        print(f"Error reconstruction XML for TU {tu_id}: {e}")
+                        logger.warning(f"XML reconstruction failed for TU {tu_id}: {e}")
                         # Fallback: text only
                         target_node.text = update_data.target_abstracted
 
