@@ -21,6 +21,8 @@ sys.path.append(current_dir)
 from core.parser import XliffParser
 from core.abstractor import TagAbstractor
 from core.logger import get_logger, setup_exception_hook
+from core.qa import QAChecker
+from core.repair import RepairWorker
 from ai.client import LLMClient
 
 # Initialize logger for this module
@@ -103,56 +105,7 @@ class TestConnectionWorker(QThread):
         except Exception as e:
             self.finished.emit(False, str(e))
 
-class RepairWorker(QThread):
-    progress = pyqtSignal(int, int)  # current, total
-    finished = pyqtSignal(int, int)  # repaired_count, failed_count
-    error = pyqtSignal(str)
-    
-    def __init__(self, units, client):
-        super().__init__()
-        self.units = units  # List of units with qa_status == "error"
-        self.client = client
-        self.is_running = True
-    
-    def run(self):
-        repaired_count = 0
-        failed_count = 0
-        total = len(self.units)
-        
-        try:
-            for i, unit in enumerate(self.units):
-                if not self.is_running: break
-                
-                # Extract required tokens from source
-                import re
-                pattern = re.compile(r"\{\d+\}")
-                required_tokens = pattern.findall(unit.source_abstracted or "")
-                
-                if not required_tokens:
-                    failed_count += 1
-                    continue
-                
-                # Call repair
-                fixed_target = self.client.repair_segment(
-                    source_text=unit.source_abstracted,
-                    broken_target=unit.target_abstracted or "",
-                    required_tokens=required_tokens
-                )
-                
-                # Update unit
-                if fixed_target != unit.target_abstracted:
-                    unit.target_abstracted = fixed_target
-                    unit.state = "edited"
-                    repaired_count += 1
-                else:
-                    failed_count += 1
-                
-                self.progress.emit(i + 1, total)
-            
-            self.finished.emit(repaired_count, failed_count)
-            
-        except Exception as e:
-            self.error.emit(str(e))
+
 
 
 # --- Models ---
@@ -579,6 +532,29 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(self.tab_qa)
         layout.setContentsMargins(10, 10, 10, 10)
         
+        # --- Readiness Panel ---
+        self.panel_readiness = QFrame()
+        self.panel_readiness.setObjectName("readinessPanel")
+        self.panel_readiness.setFrameShape(QFrame.Shape.StyledPanel)
+        r_layout = QHBoxLayout(self.panel_readiness)
+        
+        self.lbl_readiness_status = QLabel("<b>Status:</b> Not Checked")
+        self.lbl_readiness_stats = QLabel("Errors: 0 | Warnings: 0")
+        self.progress_health = QProgressBar()
+        self.progress_health.setRange(0, 100)
+        self.progress_health.setValue(100)
+        self.progress_health.setTextVisible(True)
+        self.progress_health.setFormat("Health: %p%")
+        self.progress_health.setFixedWidth(150)
+        
+        r_layout.addWidget(self.lbl_readiness_status)
+        r_layout.addStretch()
+        r_layout.addWidget(self.lbl_readiness_stats)
+        r_layout.addSpacing(20)
+        r_layout.addWidget(self.progress_health)
+        
+        layout.addWidget(self.panel_readiness)
+        
         # QA Toolbar
         qa_bar = QHBoxLayout()
         qa_bar.addWidget(QLabel("<b>🛡️ QA Issues Filter</b>"))
@@ -599,6 +575,11 @@ class MainWindow(QMainWindow):
         self.view_qa.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.view_qa.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.view_qa.setSortingEnabled(True)
+        
+        # Context Menu & Double Click
+        self.view_qa.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.view_qa.customContextMenuRequested.connect(self.on_qa_context_menu)
+        self.view_qa.doubleClicked.connect(self.on_qa_double_click)
         
         layout.addWidget(self.view_qa)
         
@@ -1111,71 +1092,42 @@ class MainWindow(QMainWindow):
             self.model.layoutChanged.emit()
             self.update_stats()
         
-    def run_qa(self):
+    def run_qa(self, silent=False):
         if not self.units: return
         
-        # Pattern for valid tokens
-        valid_token_pattern = re.compile(r"\{\d+\}")
-        # Pattern for invalid tokens (malformed)
-        invalid_token_pattern = re.compile(r"\{(?!\d+\})")  # { followed by non-digit or missing }
-        
+        checker = QAChecker()
         error_count = 0
         warning_count = 0
         
         for unit in self.units:
             if unit.state == "locked": continue
             
-            unit.errors = [] # Reset
-            unit.qa_details = {} # Reset
+            result = checker.check_unit(
+                unit.source_abstracted, 
+                unit.target_abstracted, 
+                unit.state
+            )
             
-            # Extract tokens from source and target
-            source_tokens = set(valid_token_pattern.findall(unit.source_abstracted or ""))
-            target_tokens = set(valid_token_pattern.findall(unit.target_abstracted or ""))
+            unit.qa_status = result.status
+            unit.tag_stats = result.tag_stats
+            unit.qa_details = result.qa_details
+            unit.errors = [issue.message for issue in result.issues]
             
-            # A. Token Set Matching (Core Check)
-            missing_tokens = source_tokens - target_tokens
-            extra_tokens = target_tokens - source_tokens
-            
-            # B. Invalid Token Detection
-            invalid_matches = invalid_token_pattern.findall(unit.target_abstracted or "")
-            
-            # Update tag_stats
-            source_tag_count = len(source_tokens)
-            target_tag_count = len(target_tokens)
-            unit.tag_stats = f"TAG: {target_tag_count}/{source_tag_count}"
-            
-            # C. QA Logic
-            has_errors = False
-            
-            if missing_tokens:
-                unit.qa_details["missing"] = sorted(list(missing_tokens))
-                unit.errors.append(f"Missing tokens: {', '.join(sorted(missing_tokens))}")
-                has_errors = True
-                
-            if extra_tokens:
-                unit.qa_details["extra"] = sorted(list(extra_tokens))
-                unit.errors.append(f"Extra tokens: {', '.join(sorted(extra_tokens))}")
-                has_errors = True
-                
-            if invalid_matches:
-                unit.qa_details["invalid"] = invalid_matches
-                unit.errors.append(f"Invalid token format: {', '.join(invalid_matches[:3])}")  # Show first 3
-                has_errors = True
-            
-            if has_errors:
-                unit.qa_status = "error"
+            if result.status == "error":
                 error_count += 1
-            elif not unit.target_abstracted and unit.state in ["translated", "edited"]:
-                unit.qa_status = "warning"
-                unit.errors.append("Empty translation")
+            elif result.status == "warning":
                 warning_count += 1
-            else:
-                unit.qa_status = "ok"
                 
         self.model.layoutChanged.emit() # Refresh UI (Icons)
         
+        # Update Readiness Panel
+        if hasattr(self, 'update_readiness_panel'):
+            self.update_readiness_panel(error_count, warning_count)
+        
+        if silent:
+            return
+
         # CRITICAL: Defer QMessageBox to avoid Access Violation
-        # QMessageBox triggers event loop re-entry which conflicts with layoutChanged
         msg = f"QA Complete.\nErrors: {error_count}\nWarnings: {warning_count}"
         if error_count > 0:
             QTimer.singleShot(100, lambda: QMessageBox.warning(self, "QA Issues Found", msg + "\n\nPlease fix ERRORS before exporting."))
@@ -1282,6 +1234,111 @@ class MainWindow(QMainWindow):
             self.parser.update_targets(self.units, path)
             logger.info(f"File exported to: {path}")
             QMessageBox.information(self, "Saved", f"Exported to {path}")
+
+    def update_readiness_panel(self, errors, warnings):
+        """Update the QA dashboard/panel"""
+        if not hasattr(self, 'panel_readiness'): return
+        
+        self.lbl_readiness_stats.setText(f"Errors: {errors} | Warnings: {warnings}")
+        
+        # Calculate health
+        total_active = len([u for u in self.units if u.state != "locked"])
+        if total_active > 0:
+            health = max(0, 100 - (errors * 5) - (warnings * 1)) # Simple penalty
+        else:
+            health = 100
+            
+        self.progress_health.setValue(health)
+        
+        # Color coding
+        if health == 100 and errors == 0:
+            self.progress_health.setStyleSheet("QProgressBar::chunk { background-color: #4CAF50; }") # Green
+            self.lbl_readiness_status.setText("<b>Status:</b> <span style='color:#4CAF50'>Ready to Export</span>")
+        elif errors > 0:
+            self.progress_health.setStyleSheet("QProgressBar::chunk { background-color: #F44336; }") # Red
+            self.lbl_readiness_status.setText("<b>Status:</b> <span style='color:#F44336'>Blocked (Fix Errors)</span>")
+        else:
+            self.progress_health.setStyleSheet("QProgressBar::chunk { background-color: #FFC107; }") # Orange
+            self.lbl_readiness_status.setText("<b>Status:</b> <span style='color:#FFC107'>Warnings Present</span>")
+
+    def on_qa_context_menu(self, pos):
+        """Show context menu for QA table"""
+        index = self.view_qa.indexAt(pos)
+        if not index.isValid(): return
+        
+        menu = QMenu(self)
+        action_jump = QAction("✏️ Quick Edit (Jump)", self)
+        action_repair = QAction("🔧 Repair Segment", self)
+        
+        action_jump.triggered.connect(lambda checked, idx=index: self.on_qa_double_click(idx))
+        action_repair.triggered.connect(lambda checked, idx=index: self.repair_single_unit(idx))
+        
+        menu.addAction(action_jump)
+        menu.addAction(action_repair)
+        
+        menu.exec(self.view_qa.viewport().mapToGlobal(pos))
+
+    def repair_single_unit(self, index):
+        source_index = self.proxy_qa.mapToSource(index)
+        unit = self.model.units[source_index.row()]
+        
+        if unit.qa_status != "error":
+             QMessageBox.information(self, "Info", "This segment does not have QA errors.")
+             return
+
+        reply = QMessageBox.question(self, "Repair Segment", "Attempt to repair this segment using AI?", 
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes: return
+
+        try:
+            client = self.get_repair_client()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+            return
+            
+        self.repair_worker = RepairWorker([unit], client)
+        self.repair_worker.finished.connect(lambda r, f: self.on_single_repair_finished(r, f))
+        self.repair_worker.error.connect(lambda e: QMessageBox.warning(self, "Repair Failed", e))
+        self.repair_worker.start()
+
+    def on_single_repair_finished(self, repaired, failed):
+        if repaired > 0:
+            QMessageBox.information(self, "Success", "Segment repaired successfully.")
+            # Defer QA check to next event loop to prevent Access Violation
+            # and avoid double layout updates (run_qa handles update)
+            QTimer.singleShot(0, lambda: self.run_qa(silent=True))
+        else:
+            QMessageBox.warning(self, "Failed", "AI could not repair the segment.")
+
+    def on_qa_double_click(self, index):
+        """Handle double click on QA table"""
+        # Get the source model index
+        source_index = self.proxy_qa.mapToSource(index)
+        row = source_index.row()
+        
+        # Switch to Translate tab
+        self.tabs.setCurrentIndex(0) # Index 0 is Worktable
+        
+        # Select the row in main table
+        self.jump_to_unit(row)
+
+    def jump_to_unit(self, row_index):
+        """Scroll to and select the unit in the main table"""
+        idx = self.model.index(row_index, 0)
+        # Map through proxy if main table uses proxy
+        if hasattr(self, 'proxy_model'):
+             proxy_idx = self.proxy_model.mapFromSource(idx)
+             if proxy_idx.isValid():
+                self.table.selectRow(proxy_idx.row())
+                self.table.scrollTo(proxy_idx)
+             else:
+                 # It might be filtered out in the main view
+                 self.proxy_model.set_status_filter("All") # Reset filter to find it
+                 self.proxy_model.set_text_filter("")
+                 proxy_idx = self.proxy_model.mapFromSource(idx)
+                 if proxy_idx.isValid():
+                     self.table.selectRow(proxy_idx.row())
+                     self.table.scrollTo(proxy_idx)
 
 if __name__ == "__main__":
     import faulthandler
