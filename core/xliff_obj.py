@@ -19,9 +19,10 @@ class TranslationUnit:
     state: str = "new" # XLIFF state attribute
     errors: List[str] = field(default_factory=list)
     
-    # New fields for V2.1
+    # New fields for V2.1+
     tag_stats: str = "" # e.g. "TAG: 2/2"
     qa_status: str = "ok" # ok, warning, error
+    qa_details: Dict[str, List[str]] = field(default_factory=dict) # {"missing": ["{0}"], "extra": ["{99}"]}
     
     def to_dict(self):
         return {

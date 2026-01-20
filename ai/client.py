@@ -137,3 +137,60 @@ class LLMClient:
             return True, f"Successfully connected to {self.model}!"
         except Exception as e:
             return False, f"Connection failed: {str(e)}"
+    
+    def repair_segment(self, source_text: str, broken_target: str, required_tokens: list) -> str:
+        """
+        Repairs a broken translation by fixing missing/extra tokens.
+        Uses a specialized prompt that enforces strict token preservation.
+        
+        Args:
+            source_text: Original source with correct tokens
+            broken_target: Current target with token errors
+            required_tokens: List of tokens that MUST appear (e.g. ["{0}", "{1}"])
+        
+        Returns:
+            Fixed translation string
+        """
+        if not self.client:
+            logger.warning("No API client for repair, returning original")
+            return broken_target
+        
+        # Construct strict repair prompt
+        required_str = ", ".join(required_tokens)
+        prompt = f"""You are a XLIFF tag repair specialist. Your ONLY task is to fix missing or extra placeholder tokens.
+
+**CRITICAL RULES**:
+1. You MUST include ALL of these tokens EXACTLY ONCE: {required_str}
+2. Do NOT add, remove, or modify any tokens beyond what's required.
+3. Do NOT translate the text again - only adjust token positions.
+4. Token format must be exactly {{n}} where n is a digit.
+
+**Required Tokens**: {required_str}
+**Source (for reference)**: {source_text}
+**Current (Broken) Translation**: {broken_target}
+
+Output ONLY the fixed translation. Nothing else."""
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "You are a tag repair tool. Follow instructions precisely."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1,  # Very low temperature for deterministic fixes
+                max_tokens=500
+            )
+            fixed = response.choices[0].message.content.strip()
+            
+            # Remove any markdown code blocks if LLM added them
+            if fixed.startswith("```"):
+                lines = fixed.split("\n")
+                fixed = "\n".join(lines[1:-1]) if len(lines) > 2 else fixed
+            
+            logger.info(f"Repair attempt: '{broken_target}' -> '{fixed}'")
+            return fixed
+            
+        except Exception as e:
+            logger.error(f"Repair Error: {e}", exc_info=True)
+            return broken_target  # Return original if repair fails

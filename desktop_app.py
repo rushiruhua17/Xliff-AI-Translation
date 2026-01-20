@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QTextEdit, QProgressBar, QSplitter, QFrame, QCheckBox,
                              QToolBar, QSpacerItem, QSizePolicy, QTabWidget)
 from PyQt6.QtCore import (Qt, QAbstractTableModel, QModelIndex, QThread, pyqtSignal, 
-                          QSize, QSettings, QSortFilterProxyModel, QRegularExpression)
+                          QSize, QSettings, QSortFilterProxyModel, QRegularExpression, QTimer)
 from PyQt6.QtGui import QAction, QIcon, QColor, QBrush, QKeySequence, QShortcut
 
 # Ensure core modules importable
@@ -103,13 +103,82 @@ class TestConnectionWorker(QThread):
         except Exception as e:
             self.finished.emit(False, str(e))
 
+class RepairWorker(QThread):
+    progress = pyqtSignal(int, int)  # current, total
+    finished = pyqtSignal(int, int)  # repaired_count, failed_count
+    error = pyqtSignal(str)
+    
+    def __init__(self, units, client):
+        super().__init__()
+        self.units = units  # List of units with qa_status == "error"
+        self.client = client
+        self.is_running = True
+    
+    def run(self):
+        repaired_count = 0
+        failed_count = 0
+        total = len(self.units)
+        
+        try:
+            for i, unit in enumerate(self.units):
+                if not self.is_running: break
+                
+                # Extract required tokens from source
+                import re
+                pattern = re.compile(r"\{\d+\}")
+                required_tokens = pattern.findall(unit.source_abstracted or "")
+                
+                if not required_tokens:
+                    failed_count += 1
+                    continue
+                
+                # Call repair
+                fixed_target = self.client.repair_segment(
+                    source_text=unit.source_abstracted,
+                    broken_target=unit.target_abstracted or "",
+                    required_tokens=required_tokens
+                )
+                
+                # Update unit
+                if fixed_target != unit.target_abstracted:
+                    unit.target_abstracted = fixed_target
+                    unit.state = "edited"
+                    repaired_count += 1
+                else:
+                    failed_count += 1
+                
+                self.progress.emit(i + 1, total)
+            
+            self.finished.emit(repaired_count, failed_count)
+            
+        except Exception as e:
+            self.error.emit(str(e))
+
+
 # --- Models ---
+
+class QAFilterProxyModel(QSortFilterProxyModel):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setDynamicSortFilter(True)
+    
+    def filterAcceptsRow(self, source_row, source_parent):
+        # Access the source model
+        source_model = self.sourceModel()
+        if not source_model: return True
+        
+        # Get the 'QA' column data (column 3 is just display text, we need the stored unit object ideally)
+        # But our model stores units in a list. Let's access the unit directly.
+        unit = source_model.units[source_row]
+        
+        # Keep row if status is NOT 'ok' (i.e., 'error' or 'warning')
+        return unit.qa_status != "ok"
 
 class XliffTableModel(QAbstractTableModel):
     def __init__(self, units=None):
         super().__init__()
         self.units = units or []
-        self.headers = ["ID", "State", "Tags", "QA", "Source", "Target"]
+        self.headers = ["ID", "State", "Tags", "QA", "Details", "Source", "Target"]
 
     def rowCount(self, parent=QModelIndex()):
         return len(self.units)
@@ -139,8 +208,13 @@ class XliffTableModel(QAbstractTableModel):
                 if unit.qa_status == "error": return "⛔"
                 elif unit.qa_status == "warning": return "⚠️"
                 else: return "✅"
-            elif col == 4: return unit.source_abstracted
-            elif col == 5: return unit.target_abstracted
+            elif col == 4:
+                # Details column: show first error message
+                if unit.errors:
+                    return unit.errors[0]  # Show first error
+                return ""
+            elif col == 5: return unit.source_abstracted
+            elif col == 6: return unit.target_abstracted
             
         elif role == Qt.ItemDataRole.DecorationRole and col == 1:
             return None # We use DisplayRole for Emojis now
@@ -148,6 +222,21 @@ class XliffTableModel(QAbstractTableModel):
             
         elif role == Qt.ItemDataRole.ToolTipRole:
             if col == 1: return f"Status: {unit.state}"
+            elif col == 3:  # QA column
+                if unit.errors:
+                    return "\n".join(unit.errors)  # Show all errors in tooltip
+                return "No issues"
+            elif col == 4:  # Details column
+                if unit.errors:
+                    return "\n".join(unit.errors)
+                return ""
+                
+        elif role == Qt.ItemDataRole.BackgroundRole:
+            # Highlight error rows in light red
+            if unit.qa_status == "error":
+                return QBrush(QColor(255, 200, 200))  # Light red for errors
+            elif unit.qa_status == "warning":
+                return QBrush(QColor(255, 255, 200))  # Light yellow for warnings
 
         return None
 
@@ -162,14 +251,14 @@ class XliffTableModel(QAbstractTableModel):
         flags = super().flags(index)
         unit = self.units[index.row()]
         
-        if index.column() == 5:
+        if index.column() == 6:
             if unit.state != "locked":
                 flags |= Qt.ItemFlag.ItemIsEditable
         
         return flags
 
     def setData(self, index, value, role=Qt.ItemDataRole.EditRole):
-        if index.isValid() and role == Qt.ItemDataRole.EditRole and index.column() == 5:
+        if index.isValid() and role == Qt.ItemDataRole.EditRole and index.column() == 6:
             unit = self.units[index.row()]
             if unit.state == "locked": return False
             
@@ -261,12 +350,16 @@ class MainWindow(QMainWindow):
         self.proxy_model = XliffFilterProxyModel()
         self.proxy_model.setSourceModel(self.model)
         
+        self.proxy_qa = QAFilterProxyModel()
+        self.proxy_qa.setSourceModel(self.model)
+        
         self.active_unit_index_map = -1 # Mapped index in source model
         
         # Workers
         self.trans_worker = None
         self.refine_worker = None
         self.test_worker = None
+        self.repair_worker = None
         
         self.setup_ui()
         self.load_settings()
@@ -282,7 +375,12 @@ class MainWindow(QMainWindow):
         self.setup_translate_tab()
         self.tabs.addTab(self.tab_translate, "Worktable")
         
-        # --- Tab 2: Settings ---
+        # --- Tab 2: QA Focus ---
+        self.tab_qa = QWidget()
+        self.setup_qa_tab()
+        self.tabs.addTab(self.tab_qa, "🛡️ QA Review")
+        
+        # --- Tab 3: Settings ---
         self.tab_settings = QWidget()
         self.setup_settings_tab()
         self.tabs.addTab(self.tab_settings, "Settings")
@@ -396,7 +494,23 @@ class MainWindow(QMainWindow):
         self.btn_qa.clicked.connect(self.run_qa)
         top_bar.addWidget(self.btn_qa)
         
+        self.btn_batch_repair = QPushButton("🔧 Batch Auto-Repair")
+        self.btn_batch_repair.clicked.connect(self.batch_auto_repair)
+        top_bar.addWidget(self.btn_batch_repair)
+        
         top_bar.addSpacing(20)
+        self.health_bar = QProgressBar()
+        self.health_bar.setFixedWidth(150)
+        self.health_bar.setTextVisible(True)
+        self.health_bar.setFormat("Health: %p%")
+        self.health_bar.setToolTip("Export Readiness (segments without critical errors)")
+        self.health_bar.setStyleSheet("""
+            QProgressBar { border: 1px solid #3C4043; border-radius: 4px; text-align: center; }
+            QProgressBar::chunk { background-color: #4CAF50; }
+        """)
+        top_bar.addWidget(self.health_bar)
+        
+        top_bar.addSpacing(10)
         self.lbl_stats = QLabel("No file loaded")
         top_bar.addWidget(self.lbl_stats)
         
@@ -453,12 +567,48 @@ class MainWindow(QMainWindow):
         h = self.table.horizontalHeader()
         h.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents) # ID
         h.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents) # State
-        h.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents) # Tags (New)
-        h.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents) # QA (New)
-        h.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch) # Source
-        h.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch) # Target
+        h.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents) # Tags
+        h.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents) # QA
+        h.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch) # Details (Errors)
+        h.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch) # Source
+        h.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch) # Target
         
         layout.addWidget(self.table)
+
+    def setup_qa_tab(self):
+        layout = QVBoxLayout(self.tab_qa)
+        layout.setContentsMargins(10, 10, 10, 10)
+        
+        # QA Toolbar
+        qa_bar = QHBoxLayout()
+        qa_bar.addWidget(QLabel("<b>🛡️ QA Issues Filter</b>"))
+        qa_bar.addWidget(QLabel("(Showing only errors & warnings)"))
+        qa_bar.addStretch()
+        
+        # Button to re-apply filter manualy if needed (usually auto)
+        btn_refresh = QPushButton("🔄 Refresh Filter")
+        btn_refresh.clicked.connect(lambda: self.proxy_qa.invalidate())
+        qa_bar.addWidget(btn_refresh)
+        
+        layout.addLayout(qa_bar)
+        
+        # QA Table Viewer
+        self.view_qa = QTableView()
+        self.view_qa.setModel(self.proxy_qa)
+        self.view_qa.setAlternatingRowColors(True)
+        self.view_qa.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.view_qa.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.view_qa.setSortingEnabled(True)
+        
+        layout.addWidget(self.view_qa)
+        
+        # Connect selection
+        self.view_qa.selectionModel().selectionChanged.connect(self.on_qa_selection_changed)
+        
+        # Headers formatting (initial, will be updated in open_file)
+        h = self.view_qa.horizontalHeader()
+        h.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        h.setStretchLastSection(True)
 
     def setup_settings_tab(self):
         layout = QVBoxLayout(self.tab_settings)
@@ -525,6 +675,43 @@ class MainWindow(QMainWindow):
         l_layout.addWidget(self.combo_tgt)
         grp_lang.setLayout(l_layout)
         layout.addWidget(grp_lang)
+        
+        # Auto-Repair Config (Optional Feature)
+        grp_repair = QGroupBox("Auto-Repair (Optional)")
+        repair_layout = QVBoxLayout()
+        
+        # Enable Toggle
+        self.chk_auto_repair = QCheckBox("Enable Auto-Repair")
+        self.chk_auto_repair.setToolTip("Use a secondary AI model to automatically fix tag errors")
+        repair_layout.addWidget(self.chk_auto_repair)
+        
+        # Repair Model
+        h_repair_model = QHBoxLayout()
+        h_repair_model.addWidget(QLabel("Repair Model:"))
+        self.txt_repair_model = QLineEdit()
+        self.txt_repair_model.setPlaceholderText("deepseek-chat")
+        h_repair_model.addWidget(self.txt_repair_model)
+        repair_layout.addLayout(h_repair_model)
+        
+        # Repair API Key
+        h_repair_key = QHBoxLayout()
+        h_repair_key.addWidget(QLabel("Repair API Key:"))
+        self.txt_repair_apikey = QLineEdit()
+        self.txt_repair_apikey.setEchoMode(QLineEdit.EchoMode.Password)
+        self.txt_repair_apikey.setPlaceholderText("sk-... (Optional, uses main key if empty)")
+        h_repair_key.addWidget(self.txt_repair_apikey)
+        repair_layout.addLayout(h_repair_key)
+        
+        # Repair Base URL
+        h_repair_url = QHBoxLayout()
+        h_repair_url.addWidget(QLabel("Repair Base URL:"))
+        self.txt_repair_base_url = QLineEdit()
+        self.txt_repair_base_url.setPlaceholderText("https://api.deepseek.com")
+        h_repair_url.addWidget(self.txt_repair_base_url)
+        repair_layout.addLayout(h_repair_url)
+        
+        grp_repair.setLayout(repair_layout)
+        layout.addWidget(grp_repair)
 
         layout.addStretch()
 
@@ -576,6 +763,12 @@ class MainWindow(QMainWindow):
             self.txt_apikey.setText(self.settings.value("api_key", ""))
             self.txt_model.setText(self.settings.value("model", ""))
             self.txt_base_url.setText(self.settings.value("base_url", ""))
+            
+            # Auto-Repair config
+            self.chk_auto_repair.setChecked(self.settings.value("auto_repair_enabled", False, type=bool))
+            self.txt_repair_model.setText(self.settings.value("repair_model", "deepseek-chat"))
+            self.txt_repair_apikey.setText(self.settings.value("repair_api_key", ""))
+            self.txt_repair_base_url.setText(self.settings.value("repair_base_url", "https://api.deepseek.com"))
             
             # Geometry
             geo = self.settings.value("geometry")
@@ -657,15 +850,57 @@ class MainWindow(QMainWindow):
                 
                 self.model.update_data(self.units)
                 self.proxy_model.invalidate()
+                self.proxy_qa.invalidate()
+                self.view_qa.setModel(self.proxy_qa)
+                
+                # Format headers for both tables
+                for v in [self.table, self.view_qa]:
+                    h = v.horizontalHeader()
+                    h.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents) # ID
+                    h.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents) # State
+                    h.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents) # Tags
+                    h.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents) # QA
+                    h.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch) # Details
+                    h.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch) # Source
+                    h.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch) # Target
+                
                 self.update_stats()
             except Exception as e:
                 logger.error(f"Failed to open file: {e}", exc_info=True)
                 QMessageBox.critical(self, "Error", str(e))
 
     def update_stats(self):
+        if not self.units:
+            self.lbl_stats.setText("No file loaded")
+            return
+            
         total = len(self.units)
         done = sum(1 for u in self.units if u.target_abstracted)
-        self.lbl_stats.setText(f"Total: {total} | Translated: {done}")
+        errors = sum(1 for u in self.units if u.qa_status == "error")
+        warnings = sum(1 for u in self.units if u.qa_status == "warning")
+        
+        # RICH stats display
+        stats_html = f"<b>Total:</b> {total} | <b>Done:</b> {done}"
+        if errors > 0:
+            stats_html += f" | <span style='color:#FF5252;'><b>🚨 {errors} Errors</b></span>"
+        elif total > 0:
+            stats_html += " | <span style='color:#4CAF50;'>✅ All Clean</span>"
+            
+        if warnings > 0:
+            stats_html += f" | <span style='color:#FFD740;'><b>⚠️ {warnings} Warnings</b></span>"
+            
+        self.lbl_stats.setText(stats_html)
+        
+        # Update Health Bar
+        error_free_count = total - errors
+        health_pct = int(error_free_count / total * 100) if total > 0 else 0
+        self.health_bar.setValue(health_pct)
+        
+        # Colorize health bar if low
+        if errors > 0:
+            self.health_bar.setStyleSheet("QProgressBar::chunk { background-color: #FF5252; }")
+        else:
+            self.health_bar.setStyleSheet("QProgressBar::chunk { background-color: #4CAF50; }")
 
     def on_search_changed(self, text):
         self.proxy_model.set_text_filter(text)
@@ -709,21 +944,29 @@ class MainWindow(QMainWindow):
     def on_selection_changed(self, selected, deselected):
         indexes = self.table.selectionModel().selectedRows()
         if len(indexes) == 1:
-            # Get model index from proxy
             proxy_idx = indexes[0]
             source_idx = self.proxy_model.mapToSource(proxy_idx)
-            self.active_unit_index_map = source_idx.row()
-            
-            unit = self.units[self.active_unit_index_map]
-            
-            self.dock_refine.setVisible(True)
-            self.txt_source.setText(unit.source_abstracted)
-            self.txt_target_edit.setPlainText(unit.target_abstracted or "")
-            self.txt_diff.clear() # Clear specific Diff
-            self.txt_prompt.clear()
+            self.update_ui_for_unit(source_idx.row())
         else:
             self.dock_refine.setVisible(False)
             self.active_unit_index_map = -1
+
+    def on_qa_selection_changed(self, selected, deselected):
+        indexes = self.view_qa.selectionModel().selectedRows()
+        if len(indexes) == 1:
+            proxy_idx = indexes[0]
+            source_idx = self.proxy_qa.mapToSource(proxy_idx)
+            self.update_ui_for_unit(source_idx.row())
+
+    def update_ui_for_unit(self, row):
+        self.active_unit_index_map = row
+        unit = self.units[self.active_unit_index_map]
+        
+        self.dock_refine.setVisible(True)
+        self.txt_source.setText(unit.source_abstracted)
+        self.txt_target_edit.setPlainText(unit.target_abstracted or "")
+        self.txt_diff.clear()
+        self.txt_prompt.clear()
 
     def grid_navigate(self, delta):
         # Implementation for Ctrl+Up/Down
@@ -871,8 +1114,11 @@ class MainWindow(QMainWindow):
     def run_qa(self):
         if not self.units: return
         
-        # Use Python native re to avoid Qt Access Violations
-        pattern = re.compile(r"\{\d+\}")
+        # Pattern for valid tokens
+        valid_token_pattern = re.compile(r"\{\d+\}")
+        # Pattern for invalid tokens (malformed)
+        invalid_token_pattern = re.compile(r"\{(?!\d+\})")  # { followed by non-digit or missing }
+        
         error_count = 0
         warning_count = 0
         
@@ -880,21 +1126,44 @@ class MainWindow(QMainWindow):
             if unit.state == "locked": continue
             
             unit.errors = [] # Reset
+            unit.qa_details = {} # Reset
             
-            # 1. Tag Count Check
-            source_tag_count = len(unit.tags_map)
+            # Extract tokens from source and target
+            source_tokens = set(valid_token_pattern.findall(unit.source_abstracted or ""))
+            target_tokens = set(valid_token_pattern.findall(unit.target_abstracted or ""))
             
-            # Count target tags in abstract string
-            # count matches of {n}
-            matches = pattern.findall(unit.target_abstracted or "")
-            target_tag_count = len(matches)
+            # A. Token Set Matching (Core Check)
+            missing_tokens = source_tokens - target_tokens
+            extra_tokens = target_tokens - source_tokens
             
+            # B. Invalid Token Detection
+            invalid_matches = invalid_token_pattern.findall(unit.target_abstracted or "")
+            
+            # Update tag_stats
+            source_tag_count = len(source_tokens)
+            target_tag_count = len(target_tokens)
             unit.tag_stats = f"TAG: {target_tag_count}/{source_tag_count}"
             
-            # 2. Logic
-            if target_tag_count != source_tag_count:
+            # C. QA Logic
+            has_errors = False
+            
+            if missing_tokens:
+                unit.qa_details["missing"] = sorted(list(missing_tokens))
+                unit.errors.append(f"Missing tokens: {', '.join(sorted(missing_tokens))}")
+                has_errors = True
+                
+            if extra_tokens:
+                unit.qa_details["extra"] = sorted(list(extra_tokens))
+                unit.errors.append(f"Extra tokens: {', '.join(sorted(extra_tokens))}")
+                has_errors = True
+                
+            if invalid_matches:
+                unit.qa_details["invalid"] = invalid_matches
+                unit.errors.append(f"Invalid token format: {', '.join(invalid_matches[:3])}")  # Show first 3
+                has_errors = True
+            
+            if has_errors:
                 unit.qa_status = "error"
-                unit.errors.append("Tag quantity mismatch")
                 error_count += 1
             elif not unit.target_abstracted and unit.state in ["translated", "edited"]:
                 unit.qa_status = "warning"
@@ -905,11 +1174,90 @@ class MainWindow(QMainWindow):
                 
         self.model.layoutChanged.emit() # Refresh UI (Icons)
         
+        # CRITICAL: Defer QMessageBox to avoid Access Violation
+        # QMessageBox triggers event loop re-entry which conflicts with layoutChanged
         msg = f"QA Complete.\nErrors: {error_count}\nWarnings: {warning_count}"
         if error_count > 0:
-            QMessageBox.warning(self, "QA Issues Found", msg + "\n\nPlease fix ERRORS before exporting.")
+            QTimer.singleShot(100, lambda: QMessageBox.warning(self, "QA Issues Found", msg + "\n\nPlease fix ERRORS before exporting."))
         else:
-            QMessageBox.information(self, "QA Passed", msg)
+            QTimer.singleShot(100, lambda: QMessageBox.information(self, "QA Passed", msg))
+
+    def get_repair_client(self):
+        """Create a secondary LLM client for repair tasks (uses Repair Model config)"""
+        if not self.chk_auto_repair.isChecked():
+            raise ValueError("Auto-Repair is not enabled in Settings")
+        
+        # Use repair config if provided, otherwise fallback to main config
+        repair_key = self.txt_repair_apikey.text() or self.txt_apikey.text()
+        repair_model = self.txt_repair_model.text() or "deepseek-chat"
+        repair_url = self.txt_repair_base_url.text() or "https://api.deepseek.com"
+        
+        if not repair_key:
+            raise ValueError("Repair API Key required (or main API Key)")
+        
+        return LLMClient(api_key=repair_key, base_url=repair_url, model=repair_model, provider="custom")
+    
+    def batch_auto_repair(self):
+        """Batch repair all units with qa_status == 'error'"""
+        if not self.units:
+            QMessageBox.warning(self, "No File", "Please open a file first.")
+            return
+        
+        # Check if Auto-Repair is enabled
+        if not self.chk_auto_repair.isChecked():
+            QMessageBox.information(self, "Auto-Repair Disabled", 
+                "Auto-Repair is currently disabled.\n\nPlease enable it in Settings Tab and configure a Repair Model.")
+            return
+        
+        # Filter error units
+        error_units = [u for u in self.units if u.qa_status == "error"]
+        
+        if not error_units:
+            QMessageBox.information(self, "No Errors", "No error segments found. Run QA first!")
+            return
+        
+        # Confirm action
+        reply = QMessageBox.question(self, "Batch Auto-Repair", 
+            f"Found {len(error_units)} segments with errors.\n\nAttempt to auto-repair all using AI?\n\n(This will use your Repair Model API)",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        
+        try:
+            repair_client = self.get_repair_client()
+        except Exception as e:
+            QMessageBox.critical(self, "Config Error", str(e))
+            return
+        
+        # Start repair worker
+        self.btn_batch_repair.setEnabled(False)
+        self.btn_batch_repair.setText("Repairing...")
+        self.progress.setVisible(True)
+        self.progress.setValue(0)
+        
+        self.repair_worker = RepairWorker(error_units, repair_client)
+        self.repair_worker.progress.connect(lambda c, t: self.progress.setValue(int(c/t*100)))
+        self.repair_worker.finished.connect(self.on_repair_finished)
+        self.repair_worker.error.connect(lambda e: QMessageBox.critical(self, "Repair Error", e))
+        self.repair_worker.start()
+    
+    def on_repair_finished(self, repaired_count, failed_count):
+        """Called when batch repair completes"""
+        self.btn_batch_repair.setEnabled(True)
+        self.btn_batch_repair.setText("🔧 Batch Auto-Repair")
+        self.progress.setVisible(False)
+        
+        # Refresh UI
+        self.model.layoutChanged.emit()
+        self.update_stats()
+        
+        # Re-run QA to verify fixes
+        QTimer.singleShot(500, self.run_qa)
+        
+        # Show summary
+        msg = f"Repair Complete!\n\nRepaired: {repaired_count}\nFailed: {failed_count}\n\nRe-running QA to verify..."
+        QTimer.singleShot(100, lambda: QMessageBox.information(self, "Batch Repair Done", msg))
 
     def save_file(self):
         if not self.units: return
