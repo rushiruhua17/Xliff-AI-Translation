@@ -1,6 +1,7 @@
 from lxml import etree
 from typing import List, Optional
 import os
+import re
 from .xliff_obj import TranslationUnit
 from .logger import get_logger
 
@@ -101,10 +102,14 @@ class XliffParser:
                         target_node.text = dummy_root.text
                         for child in dummy_root:
                             target_node.append(child)
+                        
+                        # Add tail if dummy_root has any (unlikely for dummy wrapper but safe)
+                        if dummy_root.tail:
+                             # This wouldn't happen for dummy, but if it did, it should be appended to the last child
+                             pass
                             
                         # Update state
-                        if update_data.state:
-                            target_node.set('state', "translated") # Force translated state for now or use valid state
+                        target_node.set('state', "translated") 
                             
                     except etree.XMLSyntaxError as e:
                         logger.warning(f"XML reconstruction failed for TU {tu_id}: {e}")
@@ -115,22 +120,17 @@ class XliffParser:
         self.tree.write(save_path, encoding="utf-8", xml_declaration=True)
 
     def _node_to_string(self, node) -> str:
-        """Converts an lxml node's *children* to a string (inner XML)."""
+        """Converts an lxml node's *children* to a string (inner XML) without namespaces."""
         if node is None:
             return ""
-        # tounicode with method='xml' includes the tag itself.
-        # We need inner content.
-        # Simple hack: tounicode(node) then strip outer tags? 
-        # Or better: iterate text and children.
         
         parts = []
         if node.text:
             parts.append(node.text)
         for child in node:
-            child_str = etree.tostring(child, encoding='unicode')
-            # Post-processing to remove specific namespace declaration if it clutters inner tags
-            # This is a bit hacky but needed to keep tags clean for abstractor regex matching
-            # and to look like original source.
-            child_str = child_str.replace(' xmlns="urn:oasis:names:tc:xliff:document:1.2"', '')
+            # Convert child to string including tail text
+            child_str = etree.tostring(child, encoding='unicode', with_tail=True)
+            # Remove all namespace declarations to keep it clean for AI/Abstractor
+            child_str = re.sub(r'\s+xmlns(:\w+)?="[^"]+"', '', child_str)
             parts.append(child_str)
         return "".join(parts)

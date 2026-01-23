@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import re
 from typing import List, Dict, Any
 
 try:
@@ -45,22 +46,42 @@ class LLMClient:
             )
             
             content = response.choices[0].message.content
-            data = json.loads(content)
+            data = self._parse_json(content)
             
             # Expecting data to be {"translations": [{"id": "...", "translation": "..."}]}
-            # Or handle list response directly if LLM is nice
             if isinstance(data, list):
                 return data
-            elif "translations" in data:
+            elif isinstance(data, dict) and "translations" in data:
                 return data["translations"]
-            else:
+            elif isinstance(data, dict):
                 # Try to parse list from values
                 return list(data.values())[0] if data else []
+            return []
 
         except Exception as e:
             logger.error(f"LLM Translation Error: {e}", exc_info=True)
             # Fallback to mock or empty on error to not crash UI
             return self._mock_translate(segments)
+
+    def _parse_json(self, text: str) -> Any:
+        """Robustly parse JSON from LLM response, handling markdown blocks."""
+        text = text.strip()
+        # Try direct parse
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+            
+        # Try regex extraction for markdown blocks or loose text
+        match = re.search(r'(\{[\s\S]*\}|\[[\s\S]*\])', text)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except json.JSONDecodeError:
+                pass
+        
+        logger.error(f"Failed to parse JSON from: {text[:100]}...")
+        return None
 
     def _mock_translate(self, segments: List[Dict[str, str]]) -> List[Dict[str, str]]:
         results = []
