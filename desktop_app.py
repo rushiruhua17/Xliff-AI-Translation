@@ -617,6 +617,15 @@ class MainWindow(QMainWindow):
         
         grp_repair.setLayout(repair_layout)
         layout.addWidget(grp_repair)
+        
+        # System & Debug Group
+        grp_system = QGroupBox("System & Debug")
+        sys_layout = QVBoxLayout()
+        self.chk_diagnostic = QCheckBox("Enable Diagnostic Mode (Requires Restart)")
+        self.chk_diagnostic.setToolTip("Enables verbose logging (QT_DEBUG_PLUGINS) for debugging crashes")
+        sys_layout.addWidget(self.chk_diagnostic)
+        grp_system.setLayout(sys_layout)
+        layout.addWidget(grp_system)
 
         layout.addStretch()
 
@@ -675,6 +684,9 @@ class MainWindow(QMainWindow):
             self.txt_repair_apikey.setText(self.settings.value("repair_api_key", ""))
             self.txt_repair_base_url.setText(self.settings.value("repair_base_url", "https://api.deepseek.com"))
             
+            # Diagnostic mode
+            self.chk_diagnostic.setChecked(self.settings.value("diagnostic_mode", False, type=bool))
+            
             # Geometry
             geo = self.settings.value("geometry")
             if geo: self.restoreGeometry(geo)
@@ -725,11 +737,11 @@ class MainWindow(QMainWindow):
         self.btn_test_conn.setEnabled(False)
         self.btn_test_conn.setText("Testing...")
         self.test_worker = TestConnectionWorker(client)
-        self.test_worker.finished.connect(lambda s, m: (
+        self.test_worker.finished.connect(lambda s, m: QTimer.singleShot(0, lambda: (
             self.btn_test_conn.setEnabled(True),
             self.btn_test_conn.setText("📡 Test Connection"),
             QMessageBox.information(self, "Result", m) if s else QMessageBox.critical(self, "Error", m)
-        ))
+        )))
         self.test_worker.start()
 
     def open_file(self):
@@ -836,7 +848,7 @@ class MainWindow(QMainWindow):
         self.trans_worker = TranslationWorker(target_units, client, self.combo_src.currentText(), self.combo_tgt.currentText())
         self.trans_worker.progress.connect(lambda c, t: self.progress.setValue(int(c/t*100)))
         self.trans_worker.finished.connect(self.on_trans_finished)
-        self.trans_worker.error.connect(lambda e: QMessageBox.critical(self, "Error", e))
+        self.trans_worker.error.connect(lambda e: QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Error", e)))
         self.trans_worker.start()
 
     def on_trans_finished(self):
@@ -844,7 +856,7 @@ class MainWindow(QMainWindow):
         self.progress.setVisible(False)
         self.model.layoutChanged.emit() # Force refresh
         self.update_stats()
-        QMessageBox.information(self, "Done", "Translation complete!")
+        QTimer.singleShot(0, lambda: QMessageBox.information(self, "Done", "Translation complete!"))
 
     def on_selection_changed(self, selected, deselected):
         indexes = self.table.selectionModel().selectedRows()
@@ -1115,7 +1127,7 @@ class MainWindow(QMainWindow):
         self.repair_worker = RepairWorker(error_units, repair_client)
         self.repair_worker.progress.connect(lambda c, t: self.progress.setValue(int(c/t*100)))
         self.repair_worker.finished.connect(self.on_repair_finished)
-        self.repair_worker.error.connect(lambda e: QMessageBox.critical(self, "Repair Error", e))
+        self.repair_worker.error.connect(lambda e: QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Repair Error", e)))
         self.repair_worker.start()
     
     def on_repair_finished(self, repaired_count, failed_count):
@@ -1222,17 +1234,17 @@ class MainWindow(QMainWindow):
             
         self.repair_worker = RepairWorker([unit], client)
         self.repair_worker.finished.connect(lambda r, f: self.on_single_repair_finished(r, f))
-        self.repair_worker.error.connect(lambda e: QMessageBox.warning(self, "Repair Failed", e))
+        self.repair_worker.error.connect(lambda e: QTimer.singleShot(0, lambda: QMessageBox.warning(self, "Repair Failed", e)))
         self.repair_worker.start()
 
     def on_single_repair_finished(self, repaired, failed):
         if repaired > 0:
-            QMessageBox.information(self, "Success", "Segment repaired successfully.")
+            QTimer.singleShot(0, lambda: QMessageBox.information(self, "Success", "Segment repaired successfully."))
             # Defer QA check to next event loop to prevent Access Violation
             # and avoid double layout updates (run_qa handles update)
             QTimer.singleShot(0, lambda: self.run_qa(silent=True))
         else:
-            QMessageBox.warning(self, "Failed", "AI could not repair the segment.")
+            QTimer.singleShot(0, lambda: QMessageBox.warning(self, "Failed", "AI could not repair the segment."))
 
     def on_qa_double_click(self, index):
         """Handle double click on QA table"""
@@ -1245,6 +1257,22 @@ class MainWindow(QMainWindow):
         
         # Select the row in main table
         self.jump_to_unit(row)
+
+    def closeEvent(self, event):
+        """Save settings on exit"""
+        self.settings.setValue("source_lang", self.combo_src.currentText())
+        self.settings.setValue("target_lang", self.combo_tgt.currentText())
+        self.settings.setValue("provider", self.combo_provider.currentText())
+        self.settings.setValue("api_key", self.txt_apikey.text())
+        self.settings.setValue("model", self.txt_model.text())
+        self.settings.setValue("base_url", self.txt_base_url.text())
+        self.settings.setValue("auto_repair_enabled", self.chk_auto_repair.isChecked())
+        self.settings.setValue("repair_model", self.txt_repair_model.text())
+        self.settings.setValue("repair_api_key", self.txt_repair_apikey.text())
+        self.settings.setValue("repair_base_url", self.txt_repair_base_url.text())
+        self.settings.setValue("diagnostic_mode", self.chk_diagnostic.isChecked())
+        self.settings.setValue("geometry", self.saveGeometry())
+        super().closeEvent(event)
 
     def jump_to_unit(self, row_index):
         """Scroll to and select the unit in the main table"""
@@ -1266,11 +1294,25 @@ class MainWindow(QMainWindow):
 
 if __name__ == "__main__":
     import faulthandler
-    # Enable fault handler to catch hard crashes (segfaults)
-    sys.stderr = open("logs/crash_dump.txt", "w", encoding="utf-8")
-    faulthandler.enable(file=sys.stderr, all_threads=True)
     
-    setup_exception_hook()  # Install global crash logger
+    # 1. Ensure logs directory exists BEFORE any redirection
+    os.makedirs("logs", exist_ok=True)
+    
+    # 2. Enable fault handler to catch hard crashes (segfaults)
+    # Use unbuffered binary mode for crash dump to ensure immediate write on crash
+    crash_file = open("logs/crash_dump.txt", "wb", buffering=0)
+    faulthandler.enable(file=crash_file, all_threads=True)
+    
+    # 3. Setup global exception hook for Python-level uncaught errors
+    setup_exception_hook()
+    
+    # 4. Diagnostic environment variables (can be toggled via settings)
+    settings = QSettings("Gemini", "XLIFF_AI_Assistant")
+    if settings.value("diagnostic_mode", False, type=bool):
+        os.environ["QT_DEBUG_PLUGINS"] = "1"
+        os.environ["QT_LOGGING_RULES"] = "*.debug=true"
+        logger.info("Diagnostic mode enabled: QT_DEBUG_PLUGINS=1")
+    
     app = QApplication(sys.argv)
     qdarktheme.setup_theme()
     logger.info("Application starting...")

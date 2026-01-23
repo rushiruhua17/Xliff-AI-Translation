@@ -157,3 +157,4 @@ cython_debug/
 
 # Project specific
 temp_uploads/
+.trae/documents/

@@ -68,7 +68,14 @@ def setup_exception_hook():
             # Allow Ctrl+C to exit without logging
             sys.__excepthook__(exc_type, exc_value, exc_tb)
             return
+        
         root_logger.critical("Uncaught exception!", exc_info=(exc_type, exc_value, exc_tb))
+        
+        # Force flush all logging handlers to ensure logs are written before crash
+        for handler in root_logger.handlers:
+            handler.flush()
+        logging.shutdown()
+        
         sys.__excepthook__(exc_type, exc_value, exc_tb)
     
     sys.excepthook = exception_hook
