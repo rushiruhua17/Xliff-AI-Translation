@@ -9,15 +9,6 @@ except ImportError:
     OpenAI = None
 
 from core.logger import get_logger
-from ai.prompts import (
-    TRANSLATION_SYSTEM_PROMPT, 
-    TRANSLATION_USER_PROMPT_TEMPLATE,
-    REFINE_SYSTEM_PROMPT,
-    REFINE_USER_PROMPT_TEMPLATE,
-    REPAIR_SYSTEM_PROMPT,
-    REPAIR_USER_PROMPT_TEMPLATE
-)
-
 logger = get_logger(__name__)
 
 class LLMClient:
@@ -46,7 +37,7 @@ class LLMClient:
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": TRANSLATION_SYSTEM_PROMPT},
+                    {"role": "system", "content": "You are a professional translator tool. Output strictly valid JSON."},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.3,
@@ -90,17 +81,19 @@ class LLMClient:
             time.sleep(1)
             return f"[Refined] {current_target}"
             
-        prompt = REFINE_USER_PROMPT_TEMPLATE.format(
-            source_text=source_text,
-            current_target=current_target,
-            instruction=instruction
+        prompt = (
+            f"You are a professional translator tool. \n"
+            f"Original Source: {source_text}\n"
+            f"Current Translation: {current_target}\n"
+            f"User Instruction: {instruction}\n\n"
+            f"Please output ONLY the refined translation string. Preserve tags {{n}}."
         )
         
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": REFINE_SYSTEM_PROMPT},
+                    {"role": "system", "content": "You are a helpful assistant. Output only the translation text."},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.3
@@ -111,12 +104,17 @@ class LLMClient:
             return current_target
 
     def create_prompt(self, segments: List[Dict[str, str]], source_lang: str, target_lang: str) -> str:
-        data_str = json.dumps(segments, ensure_ascii=False, indent=2)
-        return TRANSLATION_USER_PROMPT_TEMPLATE.format(
-            source_lang=source_lang,
-            target_lang=target_lang,
-            data_str=data_str
+        instructions = (
+            f"Translate the following segments from {source_lang} to {target_lang}.\n"
+            "IMPORTANT RULES:\n"
+            "1. Preserve all {n} tags exactly where they belong in the structure.\n"
+            "2. Do not translate the tags themselves.\n"
+            "3. Output MUST be valid JSON with key 'translations', which is a list of objects {\"id\": \"...\", \"translation\": \"...\"}.\n\n"
+            "Input Segments:\n"
         )
+        
+        data_str = json.dumps(segments, ensure_ascii=False, indent=2)
+        return instructions + data_str
 
     def test_connection(self) -> tuple[bool, str]:
         """
@@ -159,17 +157,25 @@ class LLMClient:
         
         # Construct strict repair prompt
         required_str = ", ".join(required_tokens)
-        prompt = REPAIR_USER_PROMPT_TEMPLATE.format(
-            required_str=required_str,
-            source_text=source_text,
-            broken_target=broken_target
-        )
+        prompt = f"""You are a XLIFF tag repair specialist. Your ONLY task is to fix missing or extra placeholder tokens.
+
+**CRITICAL RULES**:
+1. You MUST include ALL of these tokens EXACTLY ONCE: {required_str}
+2. Do NOT add, remove, or modify any tokens beyond what's required.
+3. Do NOT translate the text again - only adjust token positions.
+4. Token format must be exactly {{n}} where n is a digit.
+
+**Required Tokens**: {required_str}
+**Source (for reference)**: {source_text}
+**Current (Broken) Translation**: {broken_target}
+
+Output ONLY the fixed translation. Nothing else."""
 
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": REPAIR_SYSTEM_PROMPT},
+                    {"role": "system", "content": "You are a tag repair tool. Follow instructions precisely."},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.1,  # Very low temperature for deterministic fixes
