@@ -912,10 +912,10 @@ class MainWindow(QMainWindow):
         meta = self.current_profile.project_metadata
         
         details = []
-        # Line 1: Template & Audience
-        p_type = meta.project_type or "General"
-        audience = meta.target_audience or "General"
-        details.append(f"<b>Type:</b> {p_type} | <b>Audience:</b> {audience}")
+        # Line 1: Label & Audience
+        label = meta.label or "None"
+        audience = brief.target_audience or "General"
+        details.append(f"<b>Label:</b> {label} | <b>Audience:</b> {audience}")
         
         # Line 2: Tone, Formality & Locale
         tone = brief.tone or "neutral"

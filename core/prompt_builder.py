@@ -30,14 +30,9 @@ class PromptBuilder:
             if brief.locale_variant:
                 constraints.append(f"Locale Variant: {brief.locale_variant}")
             
-            # 2. Project Context
-            meta = profile.project_metadata
-            if meta.domain:
-                constraints.append(f"Domain: {meta.domain}")
-            if meta.target_audience:
-                constraints.append(f"Target Audience: {meta.target_audience}")
-            if meta.client_name:
-                constraints.append(f"Client: {meta.client_name}")
+            # 2. Audience (Moved from Metadata)
+            if brief.target_audience:
+                constraints.append(f"Target Audience: {brief.target_audience}")
                 
             # 3. Formatting & Terminology (Strict)
             if brief.formatting.preserve_placeholders:

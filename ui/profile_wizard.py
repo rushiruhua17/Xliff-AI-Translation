@@ -5,6 +5,7 @@ from PyQt6.QtWidgets import (
     QMessageBox, QFormLayout, QWidget, QGroupBox
 )
 from PyQt6.QtCore import Qt, QSettings
+from PyQt6.QtGui import QFont, QColor
 from core.profile import TranslationProfile, ProfileStatus, ProfileTemplate, TranslationProfileContainer
 from ui.components import CollapsibleBox
 
@@ -31,9 +32,9 @@ class ProfileWizardDialog(QDialog):
         
         # Stack
         self.stack = QStackedWidget()
-        self.step1 = self.create_step1_metadata()
+        # self.step1 = self.create_step1_metadata() # Removed per new direction
         self.step2 = self.create_step2_brief()
-        self.stack.addWidget(self.step1)
+        # self.stack.addWidget(self.step1)
         self.stack.addWidget(self.step2)
         
         self.main_layout.addWidget(self.stack)
@@ -42,20 +43,15 @@ class ProfileWizardDialog(QDialog):
         self.btn_layout = QHBoxLayout()
         self.btn_cancel = QPushButton("Cancel")
         self.btn_skip = QPushButton("Skip Setup")
-        self.btn_back = QPushButton("Back")
-        self.btn_next = QPushButton("Next")
-        
-        self.btn_back.setVisible(False)
+        self.btn_next = QPushButton("Save & Apply")
         
         self.btn_cancel.clicked.connect(self.reject)
         self.btn_skip.clicked.connect(self.on_skip)
-        self.btn_back.clicked.connect(self.on_back)
         self.btn_next.clicked.connect(self.on_next)
         
         self.btn_layout.addWidget(self.btn_cancel)
         self.btn_layout.addWidget(self.btn_skip)
         self.btn_layout.addStretch()
-        self.btn_layout.addWidget(self.btn_back)
         self.btn_layout.addWidget(self.btn_next)
         
         self.main_layout.addLayout(self.btn_layout)
@@ -67,15 +63,16 @@ class ProfileWizardDialog(QDialog):
         self.connect_dirty_signals()
 
     def connect_dirty_signals(self):
-        # Step 1
-        self.inp_client.textChanged.connect(self.set_dirty)
-        self.inp_domain.textChanged.connect(self.set_dirty)
-        self.inp_audience.textChanged.connect(self.set_dirty)
+        # Step 1 (Removed)
+        # self.inp_client.textChanged.connect(self.set_dirty)
+        # self.inp_domain.textChanged.connect(self.set_dirty)
+        # self.inp_audience.textChanged.connect(self.set_dirty)
         
         # Step 2
+        self.inp_label.textChanged.connect(self.set_dirty)
         self.combo_tone.currentTextChanged.connect(self.set_dirty)
         self.combo_formality.currentTextChanged.connect(self.set_dirty)
-        self.inp_locale.textChanged.connect(self.set_dirty)
+        self.combo_locale.currentTextChanged.connect(self.set_dirty)
         self.txt_style.textChanged.connect(self.set_dirty)
         
         # Advanced
@@ -92,18 +89,15 @@ class ProfileWizardDialog(QDialog):
 
     def apply_smart_defaults(self):
         # Only apply if fields are empty (don't overwrite existing profile data)
-        if not self.profile.project_metadata.client_name:
-            self.inp_client.setText(self.settings.value("wizard_last_client", ""))
-        
-        if not self.profile.project_metadata.domain:
-            self.inp_domain.setText(self.settings.value("wizard_last_domain", ""))
-            
         if not self.profile.brief.tone or self.profile.brief.tone == "neutral":
              last_tone = self.settings.value("wizard_last_tone", "neutral")
              self.combo_tone.setCurrentText(last_tone)
              
         if not self.profile.brief.locale_variant:
-            self.inp_locale.setText(self.settings.value("wizard_last_locale", ""))
+            last_locale = self.settings.value("wizard_last_locale", "")
+            idx = self.combo_locale.findText(last_locale, Qt.MatchFlag.MatchContains)
+            if idx >= 0:
+                self.combo_locale.setCurrentIndex(idx)
             
         # Last Template (Prompt 4)
         last_template = self.settings.value("wizard_last_template_index", 0, type=int)
@@ -111,35 +105,25 @@ class ProfileWizardDialog(QDialog):
 
     def save_smart_defaults(self):
         # Save generic preferences for next time
-        self.settings.setValue("wizard_last_client", self.inp_client.text())
-        self.settings.setValue("wizard_last_domain", self.inp_domain.text())
         self.settings.setValue("wizard_last_tone", self.combo_tone.currentText())
         self.settings.setValue("wizard_last_locale", self.inp_locale.text())
         self.settings.setValue("wizard_last_template_index", self.combo_template.currentIndex())
 
-    def create_step1_metadata(self):
-        w = QWidget()
-        layout = QFormLayout()
-        
-        self.inp_client = QLineEdit(self.profile.project_metadata.client_name)
-        self.inp_client.setPlaceholderText("e.g. Acme Corp")
-        
-        self.inp_domain = QLineEdit(self.profile.project_metadata.domain)
-        self.inp_domain.setPlaceholderText("e.g. Medical, Legal, Gaming")
-        
-        self.inp_audience = QLineEdit(self.profile.project_metadata.target_audience)
-        self.inp_audience.setPlaceholderText("e.g. End Users, Developers")
-        
-        layout.addRow("Client Name:", self.inp_client)
-        layout.addRow("Domain / Subject:", self.inp_domain)
-        layout.addRow("Target Audience:", self.inp_audience)
-        
-        w.setLayout(layout)
-        return w
+    # create_step1_metadata Removed
 
     def create_step2_brief(self):
         w = QWidget()
         layout = QVBoxLayout()
+        
+        # Label (Optional)
+        h_label = QHBoxLayout()
+        h_label.addWidget(QLabel("Label (Optional):"))
+        self.inp_label = QLineEdit(self.profile.project_metadata.label)
+        self.inp_label.setPlaceholderText("e.g. My Note")
+        self.inp_label.setToolTip("Optional tag for your reference. Not sent to AI.")
+        h_label.addWidget(self.inp_label)
+        layout.addLayout(h_label)
+        layout.addSpacing(10)
         
         # Template Selector (Phase 1)
         h_template = QHBoxLayout()
@@ -164,6 +148,11 @@ class ProfileWizardDialog(QDialog):
         
         # Brief Fields
         form = QFormLayout()
+        
+        # Target Audience (Moved from Step 1)
+        self.inp_audience = QLineEdit(self.profile.brief.target_audience)
+        self.inp_audience.setPlaceholderText("e.g. End Users, Developers")
+        
         self.combo_tone = QComboBox()
         self.combo_tone.addItems(["neutral", "formal", "casual", "friendly", "authoritative", "neutral_informative", "formal_legal", "friendly_instructive", "marketing"])
         self.combo_tone.setCurrentText(self.profile.brief.tone)
@@ -172,12 +161,15 @@ class ProfileWizardDialog(QDialog):
         self.combo_formality.addItems(["neutral", "formal", "informal", "neutral_professional", "casual"])
         self.combo_formality.setCurrentText(self.profile.brief.formality)
         
-        self.inp_locale = QLineEdit(self.profile.brief.locale_variant)
-        self.inp_locale.setPlaceholderText("e.g. zh-CN, en-US")
+        self.combo_locale = QComboBox()
+        self.populate_locale_combo()
+        self.combo_locale.setEditable(False) # Fixed: Not editable per user request
+        self.combo_locale.setCurrentText(self.profile.brief.locale_variant)
         
+        form.addRow("Target Audience:", self.inp_audience)
         form.addRow("Tone:", self.combo_tone)
         form.addRow("Formality:", self.combo_formality)
-        form.addRow("Locale Variant:", self.inp_locale)
+        form.addRow("Locale Variant:", self.combo_locale)
         
         layout.addLayout(form)
         
@@ -206,25 +198,32 @@ class ProfileWizardDialog(QDialog):
         
         # 2. Formatting Rules
         fmt_group = QGroupBox("Formatting & Units")
-        fmt_layout = QFormLayout()
+        fmt_layout = QVBoxLayout()
         
         self.chk_nums = QCheckBox("Preserve Source Numbers")
         self.chk_nums.setChecked(self.profile.brief.formatting.preserve_source_numbers)
+        fmt_layout.addWidget(self.chk_nums)
         
+        # Unit System Row
+        h_units = QHBoxLayout()
+        h_units.addWidget(QLabel("Unit System:"))
         self.combo_units = QComboBox()
         self.combo_units.addItems(["SI", "Imperial", "Mixed"])
         self.combo_units.setCurrentText(self.profile.brief.formatting.unit_system)
+        h_units.addWidget(self.combo_units)
+        h_units.addStretch()
+        fmt_layout.addLayout(h_units)
         
         self.chk_dual = QCheckBox("Show Dual Units (e.g. SI + Imperial)")
         self.chk_dual.setChecked(self.profile.brief.formatting.dual_units)
+        fmt_layout.addWidget(self.chk_dual)
         
-        self.chk_placeholders = QCheckBox("Strict Placeholders {n}")
-        self.chk_placeholders.setChecked(self.profile.brief.formatting.preserve_placeholders)
+        self.chk_placeholders = QCheckBox("Strict Placeholders {n} (Required)")
+        self.chk_placeholders.setChecked(True)
+        self.chk_placeholders.setEnabled(False) # Locked for safety
+        self.chk_placeholders.setToolTip("This setting is required to ensure XLIFF file structure remains valid during round-trip.")
+        fmt_layout.addWidget(self.chk_placeholders)
         
-        fmt_layout.addRow("", self.chk_nums)
-        fmt_layout.addRow("Unit System:", self.combo_units)
-        fmt_layout.addRow("", self.chk_dual)
-        fmt_layout.addRow("", self.chk_placeholders)
         fmt_group.setLayout(fmt_layout)
         adv_layout.addWidget(fmt_group)
         
@@ -241,6 +240,44 @@ class ProfileWizardDialog(QDialog):
         
         w.setLayout(layout)
         return w
+
+    def populate_locale_combo(self):
+        self.combo_locale.clear()
+        
+        groups = {
+            "中文 (Chinese)": ["zh-CN", "zh-TW", "zh-HK"],
+            "英语 (English)": ["en-US", "en-GB", "en-CA", "en-AU"],
+            "日语 (Japanese)": ["ja-JP"],
+            "德语 (German)": ["de-DE"],
+            "法语 (French)": ["fr-FR"]
+        }
+        
+        font_header = QFont()
+        font_header.setBold(True)
+        
+        # Simple theme detection
+        is_dark = self.settings.value("theme", "dark") == "dark"
+        header_bg = QColor("#3C4043") if is_dark else QColor("#f0f0f0")
+        header_fg = QColor("#60CDFF") if is_dark else QColor("#007AFF")
+
+        for i, (group_name, codes) in enumerate(groups.items()):
+            # Add Separator before group (except first)
+            if i > 0:
+                self.combo_locale.insertSeparator(self.combo_locale.count())
+            
+            # Add Header
+            self.combo_locale.addItem(f"--- {group_name} ---")
+            idx = self.combo_locale.count() - 1
+            model_item = self.combo_locale.model().item(idx)
+            if model_item:
+                model_item.setEnabled(False)
+                model_item.setFont(font_header)
+                model_item.setBackground(header_bg)
+                model_item.setForeground(header_fg)
+            
+            # Add Codes
+            for code in codes:
+                self.combo_locale.addItem(code, code) # Text, Data
 
     def on_template_changed(self, index):
         data = self.combo_template.currentData()
@@ -312,11 +349,10 @@ class ProfileWizardDialog(QDialog):
         self.btn_auto.setText("✨ Auto-Detect")
         
         # Apply suggestions
-        if suggested_profile.project_metadata.project_type:
-            self.inp_domain.setText(suggested_profile.project_metadata.project_type)
+        # No project type or domain anymore
         
-        if suggested_profile.project_metadata.target_audience:
-            self.inp_audience.setText(suggested_profile.project_metadata.target_audience)
+        if suggested_profile.brief.target_audience:
+            self.inp_audience.setText(suggested_profile.brief.target_audience)
             
         if suggested_profile.brief.tone:
             # Map loosely or set custom? 
@@ -350,15 +386,23 @@ class ProfileWizardDialog(QDialog):
         self.set_dirty()
 
     def save_data_to_profile(self):
-        # Step 1
-        self.profile.project_metadata.client_name = self.inp_client.text()
-        self.profile.project_metadata.domain = self.inp_domain.text()
-        self.profile.project_metadata.target_audience = self.inp_audience.text()
+        # Step 1 Fields (Moved to Step 2 or Removed)
+        # self.profile.project_metadata.client_name = ... # Removed
+        # self.profile.project_metadata.domain = ... # Removed
+        self.profile.project_metadata.label = self.inp_label.text()
         
-        # Step 2
+        # Brief
+        self.profile.brief.target_audience = self.inp_audience.text()
         self.profile.brief.tone = self.combo_tone.currentText()
         self.profile.brief.formality = self.combo_formality.currentText()
-        self.profile.brief.locale_variant = self.inp_locale.text()
+        
+        # Locale: Use data if selected, else text
+        locale_data = self.combo_locale.currentData()
+        if locale_data:
+            self.profile.brief.locale_variant = locale_data
+        else:
+            self.profile.brief.locale_variant = self.combo_locale.currentText()
+            
         self.profile.brief.style_guide_notes = self.txt_style.toPlainText()
         
         # Advanced - Terminology
@@ -387,16 +431,11 @@ class ProfileWizardDialog(QDialog):
         super().reject()
 
     def on_next(self):
-        if self.stack.currentIndex() == 0:
-            self.stack.setCurrentIndex(1)
-            self.btn_back.setVisible(True)
-            self.btn_next.setText("Finish")
-        else:
-            # Finish
-            self.save_data_to_profile()
-            self.save_smart_defaults() # Save for next time
-            self.result_code = WizardResult.ACCEPTED
-            self.accept()
+        # Single page wizard now
+        self.save_data_to_profile()
+        self.save_smart_defaults() # Save for next time
+        self.result_code = WizardResult.ACCEPTED
+        self.accept()
 
     def on_back(self):
         self.stack.setCurrentIndex(0)

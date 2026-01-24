@@ -90,12 +90,11 @@ class ProfileGeneratorWorker(QThread):
             from ai.client import LLMClient
             client = LLMClient(**self.client_config)
             
-            # 1. Construct analysis prompt (Comprehensive for schema v1.0)
+            # 1. Construct analysis prompt (Focused on Brief fields)
             prompt = (
-                "Analyze the following text sample and suggest a comprehensive translation profile.\n"
+                "Analyze the following text sample and suggest a comprehensive translation brief.\n"
                 "Return strictly valid JSON matching this schema version 1.0:\n"
                 "{\n"
-                "  \"project_type\": \"e.g. Technical Manual, Legal Policy\",\n"
                 "  \"target_audience\": \"e.g. Expert Developers, End Users\",\n"
                 "  \"tone\": \"neutral|formal|casual|friendly|authoritative\",\n"
                 "  \"formality\": \"neutral|formal|informal\",\n"
@@ -103,7 +102,8 @@ class ProfileGeneratorWorker(QThread):
                 "  \"unit_system\": \"SI|Imperial|Mixed\",\n"
                 "  \"do_not_translate\": [\"list\", \"of\", \"terms\"],\n"
                 "  \"style_guide_notes\": \"Summary of style and tone constraints\"\n"
-                "}\n\n"
+                "}\n"
+                "Do NOT guess client names or specific project types (e.g. 'Apple Manual'). Focus on style and linguistic properties.\n\n"
                 f"Sample Text:\n{self.sample_text[:3000]}"
             )
             
@@ -124,8 +124,8 @@ class ProfileGeneratorWorker(QThread):
             
             # 4. Construct Profile
             p = TranslationProfile()
-            p.project_metadata.project_type = data.get("project_type", "")
-            p.project_metadata.target_audience = data.get("target_audience", "")
+            # No longer guessing project metadata
+            p.brief.target_audience = data.get("target_audience", "")
             p.brief.tone = data.get("tone", "neutral")
             p.brief.formality = data.get("formality", "neutral")
             p.brief.style_guide_notes = data.get("style_guide_notes", "")

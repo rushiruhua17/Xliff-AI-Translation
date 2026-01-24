@@ -10,10 +10,8 @@ class ProfileStatus(str, Enum):
 
 @dataclass
 class ProjectMetadata:
-    client_name: str = ""
-    domain: str = ""
-    project_type: str = ""  # e.g., "Software UI", "Marketing", "Legal"
-    target_audience: str = ""
+    label: str = ""  # Optional user note/tag for display only
+    # Removed: client_name, domain, project_type
 
 @dataclass
 class TerminologyPolicy:
@@ -40,6 +38,7 @@ class FormattingRules:
 
 @dataclass
 class TranslationBrief:
+    target_audience: str = ""  # Moved from Metadata
     tone: str = "neutral"  # formal, casual, neutral
     formality: str = "neutral"
     locale_variant: str = ""  # e.g., "zh-CN", "zh-TW"
@@ -73,8 +72,11 @@ class TranslationProfileContainer:
         return {
             "schema_version": self.schema_version,
             "profile": {
-                "project_metadata": self.profile.project_metadata.__dict__,
+                "project_metadata": {
+                    "label": self.profile.project_metadata.label
+                },
                 "brief": {
+                    "target_audience": self.profile.brief.target_audience,
                     "tone": self.profile.brief.tone,
                     "formality": self.profile.brief.formality,
                     "locale_variant": self.profile.brief.locale_variant,
@@ -118,7 +120,9 @@ class TranslationProfileContainer:
         
         # Metadata
         meta_data = prof_data.get("project_metadata", {})
-        container.profile.project_metadata = ProjectMetadata(**meta_data)
+        container.profile.project_metadata = ProjectMetadata(
+            label=meta_data.get("label", "")
+        )
         
         # Brief
         brief_data = prof_data.get("brief", {})
@@ -126,6 +130,7 @@ class TranslationProfileContainer:
         fmt_data = brief_data.get("formatting", {})
         
         brief = TranslationBrief()
+        brief.target_audience = brief_data.get("target_audience", "")
         brief.tone = brief_data.get("tone", "neutral")
         brief.formality = brief_data.get("formality", "neutral")
         brief.locale_variant = brief_data.get("locale_variant", "")
@@ -171,16 +176,16 @@ class TranslationProfileContainer:
             p.brief.tone = "neutral"
             p.brief.formality = "neutral"
             p.brief.style_guide_notes = "Clear, concise, and instructive. Avoid jargon unless necessary."
-            p.project_metadata.project_type = "User Manual"
+            p.brief.target_audience = "End Users"
         elif template_type == ProfileTemplate.WARRANTY:
             p.brief.tone = "authoritative"
             p.brief.formality = "formal"
             p.brief.terminology.strictness = "strict"
             p.brief.style_guide_notes = "Use legal terminology. Ensure all liability disclaimers are precise."
-            p.project_metadata.project_type = "Legal / Warranty"
+            p.brief.target_audience = "Legal / General Public"
         elif template_type == ProfileTemplate.TRAINING:
             p.brief.tone = "friendly"
             p.brief.formality = "informal"
             p.brief.style_guide_notes = "Engaging and encouraging. Use direct address ('You')."
-            p.project_metadata.project_type = "Training Course"
+            p.brief.target_audience = "Learners"
         return p
