@@ -23,8 +23,11 @@ from core.abstractor import TagAbstractor
 from core.logger import get_logger, setup_exception_hook
 from core.qa import QAChecker
 from core.repair import RepairWorker
-from core.workers import TranslationWorker, RefineWorker, TestConnectionWorker
+from core.workers import TranslationWorker, RefineWorker, TestConnectionWorker, SampleWorker
+from core.profile import TranslationProfile, TranslationProfileContainer, ProfileStatus
+from ui.profile_wizard import ProfileWizardDialog, WizardResult
 from ai.client import LLMClient
+import json # Added missing import
 
 # Initialize logger for this module
 logger = get_logger(__name__)
@@ -222,6 +225,10 @@ class MainWindow(QMainWindow):
         self.units = []
         self.abstractor = TagAbstractor()
         
+        # Profile Management
+        self.current_profile = None # TranslationProfile
+        self.current_sidecar_path = None
+        
         # Models
         self.model = XliffTableModel()
         self.proxy_model = XliffFilterProxyModel()
@@ -246,6 +253,54 @@ class MainWindow(QMainWindow):
         # Central Widget is now a TabWidget
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
+        
+        # --- Translation Brief Card (Phase 3) ---
+        # A simple, always-visible card above the tabs or inside the main layout
+        # But QMainWindow central widget is occupied by tabs. 
+        # We can use a layout wrapper for central widget: VBox(BriefCard, Tabs)
+        
+        central_container = QWidget()
+        central_layout = QVBoxLayout(central_container)
+        central_layout.setContentsMargins(0,0,0,0)
+        central_layout.setSpacing(0)
+        
+        # Brief Card
+        self.brief_card = QFrame()
+        self.brief_card.setObjectName("briefCard")
+        self.brief_card.setStyleSheet("""
+            QFrame#briefCard {
+                background-color: #2D2F31;
+                border-bottom: 1px solid #3C4043;
+                padding: 10px;
+            }
+            QLabel { color: #BDC1C6; }
+            QLabel#briefTitle { font-weight: bold; color: #E8EAED; }
+        """)
+        self.brief_card.setVisible(False) # Hidden until profile loaded
+        
+        bc_layout = QHBoxLayout(self.brief_card)
+        
+        # Info
+        v_info = QVBoxLayout()
+        self.lbl_brief_title = QLabel("Translation Brief")
+        self.lbl_brief_title.setObjectName("briefTitle")
+        self.lbl_brief_details = QLabel("No Profile")
+        v_info.addWidget(self.lbl_brief_title)
+        v_info.addWidget(self.lbl_brief_details)
+        bc_layout.addLayout(v_info)
+        
+        bc_layout.addStretch()
+        
+        # Edit Button
+        self.btn_edit_brief = QPushButton("✏️ Edit Brief")
+        self.btn_edit_brief.setFixedSize(100, 30)
+        self.btn_edit_brief.clicked.connect(self.launch_profile_wizard)
+        bc_layout.addWidget(self.btn_edit_brief)
+        
+        central_layout.addWidget(self.brief_card)
+        central_layout.addWidget(self.tabs)
+        
+        self.setCentralWidget(central_container)
         
         # --- Tab 1: Translate (Workbench) ---
         self.tab_translate = QWidget()
@@ -362,6 +417,28 @@ class MainWindow(QMainWindow):
         self.btn_save = QPushButton("💾 Export")
         self.btn_save.clicked.connect(self.save_file)
         top_bar.addWidget(self.btn_save)
+        
+        # Profile Status Indicator (Phase 3.5)
+        self.lbl_profile_status = QLabel("Status: New")
+        self.lbl_profile_status.setObjectName("profileStatus")
+        self.lbl_profile_status.setStyleSheet("""
+            QLabel#profileStatus {
+                background-color: #3C4043;
+                color: #BDC1C6;
+                padding: 4px 8px;
+                border-radius: 4px;
+                font-weight: bold;
+                font-size: 12px;
+            }
+        """)
+        self.lbl_profile_status.setToolTip("Project Profile Status")
+        top_bar.addWidget(self.lbl_profile_status)
+        
+        # Sampling Button (Phase 6)
+        self.btn_sample = QPushButton("🎲 Draft Sample")
+        self.btn_sample.setToolTip("Generate a 5-segment sample to verify style")
+        self.btn_sample.clicked.connect(self.generate_sample_draft)
+        top_bar.addWidget(self.btn_sample)
         
         self.btn_trans = QPushButton("🚀 Translate All")
         self.btn_trans.clicked.connect(lambda: self.start_translation())
@@ -748,6 +825,7 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "Open XLIFF", "", "XLIFF (*.xlf *.xliff)")
         if path:
             try:
+                # 1. Load Data
                 self.parser = XliffParser(path)
                 self.parser.load()
                 raw_units = self.parser.get_translation_units()
@@ -758,13 +836,12 @@ class MainWindow(QMainWindow):
                     u.tags_map = res.tags_map
                     
                     if u.target_raw:
-                        # Attempt to abstract target as well for visualization
-                        # Note: This naively re-indexes tags. Complex re-ordering might mismatch IDs.
                         res_tgt = self.abstractor.abstract(u.target_raw)
                         u.target_abstracted = res_tgt.abstracted_text
                     
                     self.units.append(u)
                 
+                # 2. Update UI
                 self.model.update_data(self.units)
                 self.proxy_model.invalidate()
                 self.proxy_qa.invalidate()
@@ -782,9 +859,122 @@ class MainWindow(QMainWindow):
                     h.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch) # Target
                 
                 self.update_stats()
+                
+                # 3. Load Profile (Sidecar Logic)
+                self.load_profile_for_file(path)
+                
             except Exception as e:
                 logger.error(f"Failed to open file: {e}", exc_info=True)
                 QMessageBox.critical(self, "Error", str(e))
+
+    def update_profile_status_ui(self):
+        if not self.current_profile:
+            self.lbl_profile_status.setText("Status: None")
+            self.brief_card.setVisible(False)
+            return
+            
+        status = self.current_profile.controls.status
+        text = f"Profile: {status.value.title()}"
+        
+        # Color Coding
+        if status == ProfileStatus.CONFIRMED:
+            col = "#4CAF50" # Green
+            bg = "#1E3A23"
+        elif status == ProfileStatus.DRAFT:
+            col = "#FFD740" # Yellow
+            bg = "#3A341E"
+        elif status == ProfileStatus.NEW:
+            col = "#60CDFF" # Blue
+            bg = "#1E2A3A"
+        else:
+            col = "#BDC1C6"
+            bg = "#3C4043"
+            
+        self.lbl_profile_status.setText(text)
+        self.lbl_profile_status.setStyleSheet(f"""
+            QLabel#profileStatus {{
+                background-color: {bg};
+                color: {col};
+                padding: 4px 8px;
+                border-radius: 4px;
+                font-weight: bold;
+                border: 1px solid {col};
+            }}
+        """)
+        
+        # Update Brief Card (Prompt 7)
+        self.brief_card.setVisible(True)
+        brief = self.current_profile.brief
+        meta = self.current_profile.project_metadata
+        
+        details = []
+        if meta.client_name: details.append(f"Client: {meta.client_name}")
+        if brief.tone: details.append(f"Tone: {brief.tone}")
+        if brief.formality: details.append(f"Formality: {brief.formality}")
+        
+        self.lbl_brief_details.setText(" | ".join(details) if details else "Default Settings")
+
+    def load_profile_for_file(self, xliff_path):
+        """Loads profile from sidecar or creates a new one with Wizard"""
+        # Sidecar path: file.xlf -> file.profile.json
+        self.current_sidecar_path = f"{xliff_path}.profile.json"
+        
+        if os.path.exists(self.current_sidecar_path):
+            try:
+                with open(self.current_sidecar_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    container = TranslationProfileContainer.from_dict(data)
+                    self.current_profile = container.profile
+                    logger.info(f"Loaded existing profile from {self.current_sidecar_path}")
+            except Exception as e:
+                logger.error(f"Failed to load sidecar profile: {e}")
+                # Fallback to new
+                self.current_profile = TranslationProfile()
+        else:
+            # Create new default
+            self.current_profile = TranslationProfile()
+            
+        # Check Status
+        if self.current_profile.controls.status == ProfileStatus.NEW:
+            # Launch Wizard
+            self.launch_profile_wizard()
+        
+        # Always update UI
+        self.update_profile_status_ui()
+
+    def launch_profile_wizard(self):
+        if not self.current_profile: return
+        
+        dlg = ProfileWizardDialog(self.current_profile, self)
+        if dlg.exec():
+            # Accepted
+            self.current_profile = dlg.get_profile()
+            self.current_profile.controls.status = ProfileStatus.CONFIRMED
+            self.save_profile()
+            logger.info("Profile configured and saved.")
+        else:
+            if dlg.result_code == WizardResult.SKIPPED:
+                # User skipped - keep as NEW or DRAFT but don't save to disk yet
+                logger.info("Profile setup skipped.")
+                # Optional: Set status to DRAFT so we don't annoy user immediately again?
+                # Or keep NEW so it asks again next time.
+                self.lbl_profile_status.setText("Profile: Temporary (Default)")
+                pass
+            else:
+                # Cancelled - do nothing (or close file?)
+                pass
+        
+        self.update_profile_status_ui()
+
+    def save_profile(self):
+        if not self.current_profile or not self.current_sidecar_path: return
+        try:
+            container = TranslationProfileContainer(profile=self.current_profile)
+            with open(self.current_sidecar_path, 'w', encoding='utf-8') as f:
+                json.dump(container.to_dict(), f, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save profile: {e}")
+
 
     def update_stats(self):
         if not self.units:
@@ -845,7 +1035,13 @@ class MainWindow(QMainWindow):
         self.progress.setVisible(True)
         self.progress.setValue(0)
         
-        self.trans_worker = TranslationWorker(target_units, client, self.combo_src.currentText(), self.combo_tgt.currentText())
+        self.trans_worker = TranslationWorker(
+            target_units, 
+            client, 
+            self.combo_src.currentText(), 
+            self.combo_tgt.currentText(),
+            profile=self.current_profile # Pass Profile
+        )
         self.trans_worker.progress.connect(lambda c, t: self.progress.setValue(int(c/t*100)))
         self.trans_worker.finished.connect(self.on_trans_finished)
         self.trans_worker.error.connect(lambda e: QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Error", e)))
@@ -857,6 +1053,74 @@ class MainWindow(QMainWindow):
         self.model.layoutChanged.emit() # Force refresh
         self.update_stats()
         QTimer.singleShot(0, lambda: QMessageBox.information(self, "Done", "Translation complete!"))
+
+    def generate_sample_draft(self):
+        """Phase 6: Generate a small sample draft for user verification"""
+        if not self.units: return
+        
+        try:
+            client = self.get_client()
+        except Exception as e:
+            QMessageBox.warning(self, "Config Error", str(e))
+            return
+            
+        self.btn_sample.setEnabled(False)
+        self.btn_sample.setText("Sampling...")
+        
+        # Launch Worker
+        self.sample_worker = SampleWorker(
+            self.units, client, 
+            self.combo_src.currentText(), 
+            self.combo_tgt.currentText(),
+            profile=self.current_profile
+        )
+        self.sample_worker.finished.connect(self.on_sample_finished)
+        self.sample_worker.error.connect(lambda e: (
+            self.btn_sample.setEnabled(True),
+            self.btn_sample.setText("🎲 Draft Sample"),
+            QMessageBox.critical(self, "Sample Error", e)
+        ))
+        self.sample_worker.start()
+
+    def on_sample_finished(self, results):
+        self.btn_sample.setEnabled(True)
+        self.btn_sample.setText("🎲 Draft Sample")
+        
+        if not results:
+            QMessageBox.information(self, "Info", "No translatable segments found for sampling.")
+            return
+            
+        # Format results for display
+        text_preview = ""
+        for res in results:
+            text_preview += f"[ID {res['id']}] {res['translation']}\n\n"
+            
+        # Show Preview Dialog
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Sample Draft Preview")
+        dlg.resize(600, 400)
+        v = QVBoxLayout(dlg)
+        
+        lbl = QLabel("Here is a sample translation based on your current profile settings.\nIf this looks good, proceed to 'Translate All'.")
+        v.addWidget(lbl)
+        
+        txt = QTextEdit()
+        txt.setPlainText(text_preview)
+        txt.setReadOnly(True)
+        v.addWidget(txt)
+        
+        btns = QHBoxLayout()
+        btn_ok = QPushButton("Looks Good")
+        btn_ok.clicked.connect(dlg.accept)
+        btn_refine = QPushButton("Adjust Profile...")
+        btn_refine.clicked.connect(lambda: (dlg.reject(), self.launch_profile_wizard()))
+        
+        btns.addStretch()
+        btns.addWidget(btn_refine)
+        btns.addWidget(btn_ok)
+        v.addLayout(btns)
+        
+        dlg.exec()
 
     def on_selection_changed(self, selected, deselected):
         indexes = self.table.selectionModel().selectedRows()
@@ -1310,7 +1574,8 @@ if __name__ == "__main__":
     settings = QSettings("Gemini", "XLIFF_AI_Assistant")
     if settings.value("diagnostic_mode", False, type=bool):
         os.environ["QT_DEBUG_PLUGINS"] = "1"
-        os.environ["QT_LOGGING_RULES"] = "*.debug=true"
+        # Filter out extremely spammy categories
+        os.environ["QT_LOGGING_RULES"] = "*.debug=true;qt.text.emojisegmenter=false;qt.text.layout=false;qt.qpa.events=false"
         logger.info("Diagnostic mode enabled: QT_DEBUG_PLUGINS=1")
     
     app = QApplication(sys.argv)

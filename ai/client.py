@@ -26,21 +26,38 @@ class LLMClient:
             else:
                 logger.warning("OpenAI library not installed.")
 
-    def translate_batch(self, segments: List[Dict[str, str]], source_lang: str, target_lang: str) -> List[Dict[str, str]]:
+    @property
+    def chat(self):
+        """Expose the underlying OpenAI chat attribute if available."""
+        if self.client and hasattr(self.client, 'chat'):
+            return self.client.chat
+        raise AttributeError("Underlying LLM client does not support 'chat' attribute (check API Key/Connection)")
+
+    def translate_batch(self, segments: List[Dict[str, str]], source_lang: str, target_lang: str, system_prompt: str = None) -> List[Dict[str, str]]:
         if not self.client:
             # Fallback to mock if no client (or if key missing)
             logger.warning("No API Key provided, using Mock mode.")
             return self._mock_translate(segments)
 
-        prompt = self.create_prompt(segments, source_lang, target_lang)
+        # Use provided system_prompt OR fallback to default
+        if system_prompt:
+             user_content = json.dumps(segments, ensure_ascii=False, indent=2)
+             system_content = system_prompt
+        else:
+             # Legacy/Default prompt builder logic (internal)
+             prompt_full = self.create_prompt(segments, source_lang, target_lang)
+             system_content = "You are a professional translator tool. Output strictly valid JSON."
+             user_content = prompt_full
         
         try:
+            messages = [
+                {"role": "system", "content": system_content},
+                {"role": "user", "content": user_content}
+            ]
+            
             response = self.client.chat.completions.create(
                 model=self.model,
-                messages=[
-                    {"role": "system", "content": "You are a professional translator tool. Output strictly valid JSON."},
-                    {"role": "user", "content": prompt}
-                ],
+                messages=messages,
                 temperature=0.3,
                 response_format={"type": "json_object"}
             )
@@ -50,11 +67,16 @@ class LLMClient:
             
             # Expecting data to be {"translations": [{"id": "...", "translation": "..."}]}
             if isinstance(data, list):
+                # If prompt builder asked for list, return list directly
+                # Our PromptBuilder asks for list.
+                # But legacy expects {"translations": ...}
+                # We need to normalize.
                 return data
             elif isinstance(data, dict) and "translations" in data:
                 return data["translations"]
             elif isinstance(data, dict):
-                # Try to parse list from values
+                # Try to parse list from values or check if it's keys
+                # If prompt builder returns list of objects, but wrapped in dict?
                 return list(data.values())[0] if data else []
             return []
 
