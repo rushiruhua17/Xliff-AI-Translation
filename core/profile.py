@@ -56,6 +56,8 @@ class ControlsConfig:
     status: ProfileStatus = ProfileStatus.NEW
     last_modified: str = ""
     version: str = "1.0"
+    wizard_version: str = "1.0" # Added for compatibility check
+    source_fingerprint: str = "" # Added for content change detection
 
 @dataclass
 class TranslationProfile:
@@ -106,7 +108,9 @@ class TranslationProfileContainer:
                 "controls": {
                     "status": self.profile.controls.status.value,
                     "last_modified": self.profile.controls.last_modified,
-                    "version": self.profile.controls.version
+                    "version": self.profile.controls.version,
+                    "wizard_version": self.profile.controls.wizard_version,
+                    "source_fingerprint": self.profile.controls.source_fingerprint
                 }
             }
         }
@@ -165,6 +169,8 @@ class TranslationProfileContainer:
         controls.status = ProfileStatus(ctrl_data.get("status", "new"))
         controls.last_modified = ctrl_data.get("last_modified", "")
         controls.version = ctrl_data.get("version", "1.0")
+        controls.wizard_version = ctrl_data.get("wizard_version", "1.0")
+        controls.source_fingerprint = ctrl_data.get("source_fingerprint", "")
         container.profile.controls = controls
         
         return container
