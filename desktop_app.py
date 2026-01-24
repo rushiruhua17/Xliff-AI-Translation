@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHeaderView, QMessageBox, QLabel, QAbstractItemView,
                              QComboBox, QLineEdit, QGroupBox, QMenu, QDockWidget,
                              QTextEdit, QProgressBar, QSplitter, QFrame, QCheckBox,
-                             QToolBar, QSpacerItem, QSizePolicy, QTabWidget)
+                             QToolBar, QSpacerItem, QSizePolicy, QTabWidget, QDialog)
 from PyQt6.QtCore import (Qt, QAbstractTableModel, QModelIndex, QThread, pyqtSignal, 
                           QSize, QSettings, QSortFilterProxyModel, QRegularExpression, QTimer)
 from PyQt6.QtGui import QAction, QIcon, QColor, QBrush, QKeySequence, QShortcut
@@ -793,16 +793,20 @@ class MainWindow(QMainWindow):
         if model and not self.txt_model.text():
             self.txt_model.setText(model)
             
+    def get_client_config(self):
+        return {
+            "api_key": self.txt_apikey.text(),
+            "base_url": self.txt_base_url.text(),
+            "model": self.txt_model.text(),
+            "provider": "custom"
+        }
+
     def get_client(self):
-        prov = self.combo_provider.currentText()
-        key = self.txt_apikey.text()
-        base = self.txt_base_url.text()
-        model = self.txt_model.text()
-        
-        if not key:
+        config = self.get_client_config()
+        if not config["api_key"]:
             raise ValueError("API Key required")
             
-        return LLMClient(api_key=key, base_url=base, model=model, provider="custom")
+        return LLMClient(**config)
 
     def test_connection(self):
         try:
@@ -908,11 +912,18 @@ class MainWindow(QMainWindow):
         meta = self.current_profile.project_metadata
         
         details = []
-        if meta.client_name: details.append(f"Client: {meta.client_name}")
-        if brief.tone: details.append(f"Tone: {brief.tone}")
-        if brief.formality: details.append(f"Formality: {brief.formality}")
+        # Line 1: Template & Audience
+        p_type = meta.project_type or "General"
+        audience = meta.target_audience or "General"
+        details.append(f"<b>Type:</b> {p_type} | <b>Audience:</b> {audience}")
         
-        self.lbl_brief_details.setText(" | ".join(details) if details else "Default Settings")
+        # Line 2: Tone, Formality & Locale
+        tone = brief.tone or "neutral"
+        formality = brief.formality or "neutral"
+        locale = brief.locale_variant or "Default"
+        details.append(f"<b>Tone:</b> {tone} | <b>Formality:</b> {formality} | <b>Locale:</b> {locale}")
+        
+        self.lbl_brief_details.setText("<br>".join(details))
 
     def load_profile_for_file(self, xliff_path):
         """Loads profile from sidecar or creates a new one with Wizard"""
@@ -1059,7 +1070,9 @@ class MainWindow(QMainWindow):
         if not self.units: return
         
         try:
-            client = self.get_client()
+            config = self.get_client_config()
+            if not config["api_key"]:
+                raise ValueError("API Key required")
         except Exception as e:
             QMessageBox.warning(self, "Config Error", str(e))
             return
@@ -1069,7 +1082,7 @@ class MainWindow(QMainWindow):
         
         # Launch Worker
         self.sample_worker = SampleWorker(
-            self.units, client, 
+            self.units, config, 
             self.combo_src.currentText(), 
             self.combo_tgt.currentText(),
             profile=self.current_profile
@@ -1086,8 +1099,8 @@ class MainWindow(QMainWindow):
         self.btn_sample.setEnabled(True)
         self.btn_sample.setText("🎲 Draft Sample")
         
-        if not results:
-            QMessageBox.information(self, "Info", "No translatable segments found for sampling.")
+        if not results or not isinstance(results, list):
+            QMessageBox.information(self, "Info", "No translatable segments found for sampling or empty result.")
             return
             
         # Format results for display

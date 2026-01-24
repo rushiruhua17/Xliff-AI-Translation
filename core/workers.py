@@ -80,13 +80,16 @@ class ProfileGeneratorWorker(QThread):
     finished = pyqtSignal(TranslationProfile) # Returns suggested profile
     error = pyqtSignal(str)
 
-    def __init__(self, sample_text: str, client):
+    def __init__(self, sample_text: str, client_config: dict):
         super().__init__()
         self.sample_text = sample_text
-        self.client = client
+        self.client_config = client_config
 
     def run(self):
         try:
+            from ai.client import LLMClient
+            client = LLMClient(**self.client_config)
+            
             # 1. Construct analysis prompt (Comprehensive for schema v1.0)
             prompt = (
                 "Analyze the following text sample and suggest a comprehensive translation profile.\n"
@@ -105,8 +108,8 @@ class ProfileGeneratorWorker(QThread):
             )
             
             # 2. Call LLM (Using exposed chat property)
-            response = self.client.chat.completions.create(
-                model=self.client.model,
+            response = client.chat.completions.create(
+                model=client.model,
                 messages=[
                     {"role": "system", "content": "You are a localization expert. Output ONLY valid JSON."},
                     {"role": "user", "content": prompt}
@@ -138,10 +141,10 @@ class ProfileGeneratorWorker(QThread):
             self.error.emit(str(e))
 
 class SampleWorker(QThread):
-    finished = pyqtSignal(list) # Returns list of sample TranslationUnits
+    finished = pyqtSignal(list) # Returns list of sample translations
     error = pyqtSignal(str)
 
-    def __init__(self, units: List[TranslationUnit], client, source_lang: str, target_lang: str, profile=None, sample_size=5):
+    def __init__(self, units: List[TranslationUnit], client_config: dict, source_lang: str, target_lang: str, profile=None, sample_size=5):
         super().__init__()
         # Filter for non-empty source
         active_units = [u for u in units if u.source_abstracted]
@@ -157,7 +160,7 @@ class SampleWorker(QThread):
         random_m = random.sample(remaining, min(m, len(remaining))) if remaining else []
         
         self.sample_units = first_n + random_m
-        self.client = client
+        self.client_config = client_config
         self.source_lang = source_lang
         self.target_lang = target_lang
         self.profile = profile
@@ -168,6 +171,9 @@ class SampleWorker(QThread):
                 self.finished.emit([])
                 return
 
+            from ai.client import LLMClient
+            client = LLMClient(**self.client_config)
+
             system_instruction = PromptBuilder.build_system_message(
                 self.profile, self.source_lang, self.target_lang
             )
@@ -177,19 +183,12 @@ class SampleWorker(QThread):
 
             segments = [{"id": u.id, "source": u.source_abstracted} for u in self.sample_units]
             
-            results = self.client.translate_batch(
+            results = client.translate_batch(
                 segments, 
                 self.source_lang, 
                 self.target_lang,
                 system_prompt=system_instruction
             )
-            
-            # Map back but DON'T update original unit state yet (it's a draft)
-            # We return a list of "Draft" objects or just update a temporary property
-            
-            # Actually, for simplicity in MVP, we can update the target but set state to 'draft' 
-            # instead of 'translated'? Or just return the list of (id, text) tuples.
-            # Let's return the results directly to UI to display in a dialog.
             
             self.finished.emit(results)
             

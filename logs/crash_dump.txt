@@ -1,0 +1,23 @@
+Windows fatal exception: access violation
+
+Thread 0x00007018 (most recent call first):
+  File "C:\Users\wxy\AppData\Local\Programs\Python\Python311\Lib\socket.py", line 836 in create_connection
+  File "C:\Users\wxy\AppData\Local\Programs\Python\Python311\Lib\site-packages\httpcore\_backends\sync.py", line 208 in connect_tcp
+  File "C:\Users\wxy\AppData\Local\Programs\Python\Python311\Lib\site-packages\httpcore\_sync\connection.py", line 124 in _connect
+  File "C:\Users\wxy\AppData\Local\Programs\Python\Python311\Lib\site-packages\httpcore\_sync\connection.py", line 376 in handle_request
+  File "C:\Users\wxy\AppData\Local\Programs\Python\Python311\Lib\site-packages\httpcore\_sync\http_proxy.py", line 316 in handle_request
+  File "C:\Users\wxy\AppData\Local\Programs\Python\Python311\Lib\site-packages\httpcore\_sync\connection_pool.py", line 236 in handle_request
+  File "C:\Users\wxy\AppData\Local\Programs\Python\Python311\Lib\site-packages\httpx\_transports\default.py", line 250 in handle_request
+  File "C:\Users\wxy\AppData\Local\Programs\Python\Python311\Lib\site-packages\httpx\_client.py", line 1014 in _send_single_request
+  File "C:\Users\wxy\AppData\Local\Programs\Python\Python311\Lib\site-packages\httpx\_client.py", line 979 in _send_handling_redirects
+  File "C:\Users\wxy\AppData\Local\Programs\Python\Python311\Lib\site-packages\httpx\_client.py", line 942 in _send_handling_auth
+  File "C:\Users\wxy\AppData\Local\Programs\Python\Python311\Lib\site-packages\httpx\_client.py", line 914 in send
+  File "C:\Users\wxy\AppData\Local\Programs\Python\Python311\Lib\site-packages\openai\_base_client.py", line 982 in request
+  File "C:\Users\wxy\AppData\Local\Programs\Python\Python311\Lib\site-packages\openai\_base_client.py", line 1259 in post
+  File "C:\Users\wxy\AppData\Local\Programs\Python\Python311\Lib\site-packages\openai\resources\chat\completions\completions.py", line 1192 in create
+  File "C:\Users\wxy\AppData\Local\Programs\Python\Python311\Lib\site-packages\openai\_utils\_utils.py", line 286 in wrapper
+  File "F:\XLIFF AI Assistant\xliff_ai_assistant\ai\client.py", line 58 in translate_batch
+  File "F:\XLIFF AI Assistant\xliff_ai_assistant\core\workers.py", line 180 in run
+
+Current thread 0x00001874 (most recent call first):
+  File "F:\XLIFF AI Assistant\xliff_ai_assistant\desktop_app.py", line 1586 in <module>

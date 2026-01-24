@@ -109,7 +109,8 @@ class LLMClient:
         results = []
         time.sleep(0.5)
         for seg in segments:
-            txt = seg["text"]
+            # Handle both 'text' (legacy) and 'source' (PromptBuilder) keys
+            txt = seg.get("source") or seg.get("text") or ""
             results.append({
                 "id": seg["id"],
                 "translation": f"[Mock] {txt}"

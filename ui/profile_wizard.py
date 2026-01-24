@@ -104,6 +104,10 @@ class ProfileWizardDialog(QDialog):
              
         if not self.profile.brief.locale_variant:
             self.inp_locale.setText(self.settings.value("wizard_last_locale", ""))
+            
+        # Last Template (Prompt 4)
+        last_template = self.settings.value("wizard_last_template_index", 0, type=int)
+        self.combo_template.setCurrentIndex(last_template)
 
     def save_smart_defaults(self):
         # Save generic preferences for next time
@@ -111,6 +115,7 @@ class ProfileWizardDialog(QDialog):
         self.settings.setValue("wizard_last_domain", self.inp_domain.text())
         self.settings.setValue("wizard_last_tone", self.combo_tone.currentText())
         self.settings.setValue("wizard_last_locale", self.inp_locale.text())
+        self.settings.setValue("wizard_last_template_index", self.combo_template.currentIndex())
 
     def create_step1_metadata(self):
         w = QWidget()
@@ -282,7 +287,7 @@ class ProfileWizardDialog(QDialog):
             if len(sample_text) > 2000: break
             
         try:
-            client = parent.get_client()
+            client_config = parent.get_client_config()
         except Exception as e:
             QMessageBox.warning(self, "Config Error", str(e))
             return
@@ -293,7 +298,7 @@ class ProfileWizardDialog(QDialog):
         self.btn_auto.setEnabled(False)
         self.btn_auto.setText("Analyzing...")
         
-        self.gen_worker = ProfileGeneratorWorker(sample_text, client)
+        self.gen_worker = ProfileGeneratorWorker(sample_text, client_config)
         self.gen_worker.finished.connect(self.on_auto_detect_finished)
         self.gen_worker.error.connect(lambda e: (
             self.btn_auto.setEnabled(True),
