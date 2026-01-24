@@ -106,7 +106,7 @@ class ProfileWizardDialog(QDialog):
     def save_smart_defaults(self):
         # Save generic preferences for next time
         self.settings.setValue("wizard_last_tone", self.combo_tone.currentText())
-        self.settings.setValue("wizard_last_locale", self.inp_locale.text())
+        self.settings.setValue("wizard_last_locale", self.combo_locale.currentText())
         self.settings.setValue("wizard_last_template_index", self.combo_template.currentIndex())
 
     # create_step1_metadata Removed
@@ -432,10 +432,13 @@ class ProfileWizardDialog(QDialog):
 
     def on_next(self):
         # Single page wizard now
-        self.save_data_to_profile()
-        self.save_smart_defaults() # Save for next time
-        self.result_code = WizardResult.ACCEPTED
-        self.accept()
+        try:
+            self.save_data_to_profile()
+            self.save_smart_defaults() # Save for next time
+            self.result_code = WizardResult.ACCEPTED
+            self.accept()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save profile:\n{str(e)}")
 
     def on_back(self):
         self.stack.setCurrentIndex(0)

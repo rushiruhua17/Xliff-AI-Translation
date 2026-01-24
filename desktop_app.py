@@ -10,9 +10,9 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHeaderView, QMessageBox, QLabel, QAbstractItemView,
                              QComboBox, QLineEdit, QGroupBox, QMenu, QDockWidget,
                              QTextEdit, QProgressBar, QSplitter, QFrame, QCheckBox,
-                             QToolBar, QSpacerItem, QSizePolicy, QTabWidget, QDialog)
+                             QToolBar, QSpacerItem, QSizePolicy, QTabWidget, QDialog, QToolButton)
 from PyQt6.QtCore import (Qt, QAbstractTableModel, QModelIndex, QThread, pyqtSignal, 
-                          QSize, QSettings, QSortFilterProxyModel, QRegularExpression, QTimer)
+                          QSize, QSettings, QSortFilterProxyModel, QRegularExpression, QTimer, QEvent)
 from PyQt6.QtGui import QAction, QIcon, QColor, QBrush, QKeySequence, QShortcut
 
 # Ensure core modules importable
@@ -699,10 +699,11 @@ class MainWindow(QMainWindow):
         
         top_bar.addStretch()
         
-        # Theme Toggle (Small)
-        self.btn_theme = QPushButton("🌓")
-        self.btn_theme.setFixedSize(30, 30)
+        # Theme Toggle (Icon only)
+        self.btn_theme = QToolButton()
+        self.btn_theme.setToolTip("Toggle Theme")
         self.btn_theme.clicked.connect(self.toggle_theme)
+        # Icon size handled by style or system
         top_bar.addWidget(self.btn_theme)
         
         layout.addLayout(top_bar)
@@ -740,7 +741,14 @@ class MainWindow(QMainWindow):
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self.show_context_menu)
-        self.table.selectionModel().selectionChanged.connect(self.on_selection_changed)
+        self.table.selectionModel().currentChanged.connect(self.on_current_row_changed)
+        
+        # Row Height Optimization
+        self.table.setWordWrap(True)
+        self.table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+        self.table.verticalHeader().setDefaultSectionSize(40) # Default compact height
+        self.table.setMouseTracking(True) # Enable hover tracking
+        self.table.entered.connect(self.on_table_hover)
         
         # Shortcuts
         QShortcut(QKeySequence("Ctrl+Up"), self.table, lambda: self.navigate_grid(-1))
@@ -749,13 +757,12 @@ class MainWindow(QMainWindow):
         
         # Table Headers
         h = self.table.horizontalHeader()
-        h.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents) # ID
-        h.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents) # State
-        h.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents) # Tags
-        h.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents) # QA
-        h.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch) # Details (Errors)
-        h.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch) # Source
-        h.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch) # Target
+        h.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        h.customContextMenuRequested.connect(self.show_header_context_menu)
+        h.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        
+        # Default Widths (Init)
+        # We will load persisted widths in load_file or a separate method
         
         layout.addWidget(self.table)
 
@@ -954,6 +961,8 @@ class MainWindow(QMainWindow):
             text_col = "#E8EAED"
             primary_col = "#007AFF"
             title_col = "#60CDFF"
+            theme_icon = "🌙"
+            theme_tip = "Switch to Light Mode"
         else:
             bg_sidebar = "#F1F3F4" # Light gray
             bg_filter = "#FFFFFF"
@@ -961,6 +970,8 @@ class MainWindow(QMainWindow):
             text_col = "#202124"
             primary_col = "#1A73E8"
             title_col = "#1967D2"
+            theme_icon = "🌞"
+            theme_tip = "Switch to Dark Mode"
 
         self.setStyleSheet(f"""
             QLabel#appTitle {{ font-size: 24px; font-weight: bold; color: {title_col}; margin-bottom: 20px; }}
@@ -972,8 +983,9 @@ class MainWindow(QMainWindow):
             QTextEdit {{ font-family: Consolas, monospace; font-size: 13px; }}
         """)
         
-        # Update button text
-        self.btn_theme.setText("🌞 Light Mode" if theme == "dark" else "🌙 Dark Mode")
+        # Update button text/icon
+        self.btn_theme.setText(theme_icon)
+        self.btn_theme.setToolTip(theme_tip)
 
     # --- Settings persistence ---
     def load_settings(self):
@@ -1084,13 +1096,12 @@ class MainWindow(QMainWindow):
                 # Format headers for both tables
                 for v in [self.table, self.view_qa]:
                     h = v.horizontalHeader()
-                    h.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents) # ID
-                    h.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents) # State
-                    h.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents) # Tags
-                    h.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents) # QA
-                    h.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch) # Details
-                    h.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch) # Source
-                    h.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch) # Target
+                    if v == self.view_qa:
+                        h.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+                        h.setStretchLastSection(True)
+                    else:
+                        # Main Table: Restore column state
+                        self.restore_column_state()
                 
                 self.update_stats()
                 
@@ -1529,15 +1540,132 @@ class MainWindow(QMainWindow):
         
         dlg.exec()
 
-    def on_selection_changed(self, selected, deselected):
-        indexes = self.table.selectionModel().selectedRows()
-        if len(indexes) == 1:
-            proxy_idx = indexes[0]
+    def on_current_row_changed(self, current, previous):
+        """Handle row selection change: Expand current, collapse previous."""
+        if previous.isValid():
+            self.table.setRowHeight(previous.row(), 40) # Restore default
+            
+        if current.isValid():
+            # Auto-expand
+            self.table.resizeRowToContents(current.row())
+            
+            # Update Refine Dock
+            proxy_idx = current
             source_idx = self.proxy_model.mapToSource(proxy_idx)
             self.update_ui_for_unit(source_idx.row())
         else:
             self.dock_refine.setVisible(False)
             self.active_unit_index_map = -1
+
+    def on_table_hover(self, index):
+        """
+        Handle mouse hover: Expand hovered row temporarily.
+        Uses a debounce timer to prevent jitter/flickering when moving rapidly across rows.
+        """
+        # Initialize timer if needed
+        if not hasattr(self, '_hover_timer'):
+            self._hover_timer = QTimer(self)
+            self._hover_timer.setSingleShot(True)
+            self._hover_timer.timeout.connect(self._apply_hover_resize)
+
+        row = index.row()
+        current_row = self.table.currentIndex().row()
+        
+        # If we are already hovering this row (and it's processed), do nothing
+        if hasattr(self, '_last_hover_row') and self._last_hover_row == row:
+            return
+
+        # Stop any pending resize for a different row
+        self._hover_timer.stop()
+        
+        # Store target and start debounce
+        self._hover_target_index = index
+        self._hover_timer.start(100) # 100ms delay for smoothness
+
+    def _apply_hover_resize(self):
+        """Execute the actual row resizing after debounce delay"""
+        if not hasattr(self, '_hover_target_index') or not self._hover_target_index.isValid():
+            return
+            
+        index = self._hover_target_index
+        row = index.row()
+        current_row = self.table.currentIndex().row()
+        
+        last_hover = getattr(self, '_last_hover_row', -1)
+        
+        # 1. Expand NEW row first (Stability: Ensure target exists before shifting others)
+        if row != current_row:
+            self.table.resizeRowToContents(row)
+            # Enforce minimum height to prevent "collapsing" empty rows
+            if self.table.rowHeight(row) < 40:
+                self.table.setRowHeight(row, 40)
+            self._last_hover_row = row
+        else:
+            self._last_hover_row = -1
+            
+        # 2. Shrink OLD row (after new one is stable)
+        if last_hover != -1 and last_hover != current_row and last_hover != row:
+            self.table.setRowHeight(last_hover, 40)
+
+    def leaveEvent(self, event):
+        """Restore hover row when leaving window/table area"""
+        # Stop any pending hover action
+        if hasattr(self, '_hover_timer'):
+            self._hover_timer.stop()
+            
+        if hasattr(self, '_last_hover_row') and self._last_hover_row != -1:
+            if self._last_hover_row != self.table.currentIndex().row():
+                self.table.setRowHeight(self._last_hover_row, 40)
+            self._last_hover_row = -1
+        super().leaveEvent(event)
+
+    def show_header_context_menu(self, pos):
+        """Right-click on header to toggle columns."""
+        menu = QMenu(self)
+        header = self.table.horizontalHeader()
+        
+        for i in range(self.model.columnCount()):
+            name = self.model.headerData(i, Qt.Orientation.Horizontal, Qt.ItemDataRole.DisplayRole)
+            action = QAction(name, self, checkable=True)
+            action.setChecked(not header.isSectionHidden(i))
+            action.triggered.connect(lambda checked, col=i: self.toggle_column(col, checked))
+            menu.addAction(action)
+            
+        menu.exec(header.mapToGlobal(pos))
+
+    def toggle_column(self, col, visible):
+        if visible:
+            self.table.showColumn(col)
+        else:
+            self.table.hideColumn(col)
+        self.save_column_state()
+
+    def save_column_state(self):
+        header = self.table.horizontalHeader()
+        state = header.saveState()
+        self.settings.setValue("table_column_state", state)
+
+    def restore_column_state(self):
+        state = self.settings.value("table_column_state")
+        if state:
+            self.table.horizontalHeader().restoreState(state)
+        else:
+            # Default Layout
+            self.table.setColumnWidth(0, 50) # ID
+            self.table.setColumnWidth(1, 50) # State
+            self.table.setColumnWidth(2, 80) # Tags
+            self.table.setColumnWidth(3, 50) # QA
+            self.table.setColumnHidden(2, True) # Hide Tags by default
+            self.table.setColumnHidden(4, True) # Hide Details by default
+            
+            # Source/Target split remaining
+            width = self.table.width() - 250
+            self.table.setColumnWidth(5, int(width * 0.45))
+            self.table.setColumnWidth(6, int(width * 0.45))
+
+    def on_selection_changed(self, selected, deselected):
+        # Deprecated: Replaced by on_current_row_changed
+        pass
 
     def on_qa_selection_changed(self, selected, deselected):
         indexes = self.view_qa.selectionModel().selectedRows()
