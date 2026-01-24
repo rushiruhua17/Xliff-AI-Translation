@@ -25,6 +25,7 @@ from core.qa import QAChecker
 from core.repair import RepairWorker
 from core.workers import TranslationWorker, RefineWorker, TestConnectionWorker, SampleWorker
 from core.profile import TranslationProfile, TranslationProfileContainer, ProfileStatus
+from core.autosave import Autosaver
 from ui.profile_wizard import ProfileWizardDialog, WizardResult
 from ai.client import LLMClient
 import json # Added missing import
@@ -225,6 +226,9 @@ class MainWindow(QMainWindow):
         self.units = []
         self.abstractor = TagAbstractor()
         
+        # Autosave
+        self.autosaver = None
+        
         # Profile Management
         self.current_profile = None # TranslationProfile
         self.current_sidecar_path = None
@@ -244,12 +248,165 @@ class MainWindow(QMainWindow):
         self.refine_worker = None
         self.test_worker = None
         self.repair_worker = None
+        self.repair_worker = None
         
         self.setup_ui()
         self.load_settings()
         self.apply_styles()
+        
+        # Post-init: Check for crash recovery
+        # Using singleShot to let the main loop start and UI show up first
+        QTimer.singleShot(100, self.check_crash_recovery)
 
-    def setup_ui(self):
+    def check_crash_recovery(self):
+        """Check if app was closed unexpectedly and prompt for recovery."""
+        try:
+            clean_shutdown = self.settings.value("clean_shutdown", True, type=bool)
+            last_file = self.settings.value("last_active_file", "")
+            last_fingerprint = self.settings.value("last_file_fingerprint", "")
+            
+            # Reset clean shutdown flag immediately (in case we crash now)
+            self.settings.setValue("clean_shutdown", False)
+            
+            if not clean_shutdown and last_file and os.path.exists(last_file):
+                logger.info(f"Unexpected shutdown detected. Last file: {last_file}")
+                
+                # Verify fingerprint
+                current_fingerprint = Autosaver.calculate_file_fingerprint(last_file)
+                if current_fingerprint != last_fingerprint:
+                    logger.warning("Last active file has changed externally. Skipping auto-resume.")
+                    # Optional: Notify user
+                    QMessageBox.warning(self, "Session Resume Skipped", 
+                        f"The last open file '{os.path.basename(last_file)}' has been modified externally.\n\nSession resume aborted to prevent conflicts.")
+                    return
+
+                # Check for autosave
+                autosave_path = Autosaver._get_autosave_path(last_file)
+                has_autosave = os.path.exists(autosave_path)
+                
+                if has_autosave:
+                    # MERGED DIALOG: "Recover & Open", "Open Original", "Cancel"
+                    box = QMessageBox(self)
+                    box.setWindowTitle("Crash Recovery")
+                    box.setText(f"Application closed unexpectedly while editing '{os.path.basename(last_file)}'.\n\nUnsaved progress found.")
+                    box.setIcon(QMessageBox.Icon.Warning)
+                    
+                    btn_recover = box.addButton("Recover & Open", QMessageBox.ButtonRole.AcceptRole)
+                    btn_open = box.addButton("Open Original", QMessageBox.ButtonRole.ActionRole)
+                    btn_cancel = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+                    
+                    box.exec()
+                    
+                    if box.clickedButton() == btn_recover:
+                        self.load_file(last_file, auto_recover=True)
+                    elif box.clickedButton() == btn_open:
+                        self.load_file(last_file, auto_recover=False)
+                    else:
+                        pass # Do nothing
+                else:
+                    # Simple "Resume" Prompt
+                    reply = QMessageBox.question(self, "Resume Session", 
+                        f"Application closed unexpectedly.\n\nReopen '{os.path.basename(last_file)}'?",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                    
+                    if reply == QMessageBox.StandardButton.Yes:
+                        self.load_file(last_file, auto_recover=False)
+            
+            else:
+                # Clean startup or no last file
+                pass
+                
+        except Exception as e:
+            logger.error(f"Error in crash recovery check: {e}")
+
+    def load_file(self, path, auto_recover=False):
+        """
+        Internal method to load a file.
+        :param path: Absolute path to XLIFF file
+        :param auto_recover: If True, automatically apply autosave without prompt
+        """
+        try:
+            # 1. Load Data
+            self.parser = XliffParser(path)
+            self.parser.load()
+            raw_units = self.parser.get_translation_units()
+            self.units = []
+            for u in raw_units:
+                res = self.abstractor.abstract(u.source_raw)
+                u.source_abstracted = res.abstracted_text
+                u.tags_map = res.tags_map
+                
+                if u.target_raw:
+                    res_tgt = self.abstractor.abstract(u.target_raw)
+                    u.target_abstracted = res_tgt.abstracted_text
+                
+                self.units.append(u)
+            
+            # 2. Update UI
+            self.model.update_data(self.units)
+            self.proxy_model.invalidate()
+            self.proxy_qa.invalidate()
+            self.view_qa.setModel(self.proxy_qa)
+            
+            # Format headers
+            for v in [self.table, self.view_qa]:
+                h = v.horizontalHeader()
+                h.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents) 
+                h.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents) 
+                h.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents) 
+                h.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents) 
+                h.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch) 
+                h.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch) 
+                h.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch) 
+            
+            self.update_stats()
+            
+            # 3. Load Profile
+            self.load_profile_for_file(path)
+            
+            # 4. Session Tracking
+            self.settings.setValue("last_active_file", path)
+            self.settings.setValue("last_file_fingerprint", Autosaver.calculate_file_fingerprint(path))
+            
+            # 5. Autosave Init & Recovery
+            self.init_autosave(path, auto_recover=auto_recover)
+            
+        except Exception as e:
+            logger.error(f"Failed to load file: {e}", exc_info=True)
+            QMessageBox.critical(self, "Error", str(e))
+
+    def open_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Open XLIFF", "", "XLIFF (*.xlf *.xliff)")
+        if path:
+            self.load_file(path)
+
+    def init_autosave(self, file_path, auto_recover=False):
+        """Initialize autosaver and check for crash recovery"""
+        self.autosaver = Autosaver(file_path)
+        
+        recovery_data = self.autosaver.check_recovery_available()
+        if recovery_data:
+            if auto_recover:
+                # Apply silently
+                self.apply_recovery(recovery_data)
+                return
+
+            ts = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(recovery_data['timestamp']))
+            count = recovery_data.get('count', 0)
+            
+            reply = QMessageBox.question(
+                self, "Crash Recovery", 
+                f"Found unsaved progress from {ts}.\n\n"
+                f"Recover {count} segments?\n\n"
+                "(Yes to recover, No to discard)",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            
+            if reply == QMessageBox.StandardButton.Yes:
+                self.apply_recovery(recovery_data)
+            else:
+                # User chose to discard
+                self.autosaver.cleanup()
         # Central Widget is now a TabWidget
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
@@ -867,9 +1024,64 @@ class MainWindow(QMainWindow):
                 # 3. Load Profile (Sidecar Logic)
                 self.load_profile_for_file(path)
                 
+                # 4. Autosave Init & Recovery Check
+                self.init_autosave(path)
+                
             except Exception as e:
                 logger.error(f"Failed to open file: {e}", exc_info=True)
                 QMessageBox.critical(self, "Error", str(e))
+
+    def init_autosave(self, file_path):
+        """Initialize autosaver and check for crash recovery"""
+        self.autosaver = Autosaver(file_path)
+        
+        recovery_data = self.autosaver.check_recovery_available()
+        if recovery_data:
+            ts = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(recovery_data['timestamp']))
+            count = recovery_data.get('count', 0)
+            
+            reply = QMessageBox.question(
+                self, "Crash Recovery", 
+                f"Found unsaved progress from {ts}.\n\n"
+                f"Recover {count} segments?\n\n"
+                "(Yes to recover, No to discard)",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            
+            if reply == QMessageBox.StandardButton.Yes:
+                self.apply_recovery(recovery_data)
+            else:
+                # User chose to discard
+                self.autosaver.cleanup()
+
+    def apply_recovery(self, data):
+        """Apply patch from autosave to current model"""
+        try:
+            updates = data.get("units", {})
+            applied_count = 0
+            
+            for u in self.units:
+                if u.id in updates:
+                    patch = updates[u.id]
+                    u.target_abstracted = patch['target']
+                    u.state = patch['state']
+                    applied_count += 1
+            
+            self.model.layoutChanged.emit()
+            self.update_stats()
+            logger.info(f"Recovered {applied_count} segments from autosave.")
+            QMessageBox.information(self, "Recovery Complete", f"Successfully restored {applied_count} segments.")
+            
+        except Exception as e:
+            logger.error(f"Recovery failed: {e}")
+            QMessageBox.critical(self, "Recovery Failed", str(e))
+
+    def perform_autosave(self):
+        """Trigger an atomic autosave of current progress"""
+        if self.autosaver:
+            # We save everything, let Autosaver filter inside
+            # Run in main thread to ensure data consistency (it's fast JSON dump)
+            self.autosaver.save_patch(self.units)
 
     def update_profile_status_ui(self):
         if not self.current_profile:
@@ -1054,6 +1266,7 @@ class MainWindow(QMainWindow):
             profile=self.current_profile # Pass Profile
         )
         self.trans_worker.progress.connect(lambda c, t: self.progress.setValue(int(c/t*100)))
+        self.trans_worker.progress.connect(lambda c, t: self.perform_autosave())
         self.trans_worker.finished.connect(self.on_trans_finished)
         self.trans_worker.error.connect(lambda e: QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Error", e)))
         self.trans_worker.start()
@@ -1445,6 +1658,17 @@ class MainWindow(QMainWindow):
                     except Exception as e:
                         logger.warning(f"Tag reconstruction failed for unit {u.id}: {e}")
             self.parser.update_targets(self.units, path)
+            
+            # Cleanup autosave on successful export
+            if self.autosaver:
+                self.autosaver.cleanup()
+            
+            # Remove "active file" on successful export/save? 
+            # No, user might keep editing. 
+            # But maybe we update the fingerprint because file changed?
+            # Yes, file on disk changed, so fingerprint changed.
+            self.settings.setValue("last_file_fingerprint", Autosaver.calculate_file_fingerprint(path))
+                
             logger.info(f"File exported to: {path}")
             QMessageBox.information(self, "Saved", f"Exported to {path}")
 
@@ -1549,6 +1773,10 @@ class MainWindow(QMainWindow):
         self.settings.setValue("repair_base_url", self.txt_repair_base_url.text())
         self.settings.setValue("diagnostic_mode", self.chk_diagnostic.isChecked())
         self.settings.setValue("geometry", self.saveGeometry())
+        
+        # Mark clean shutdown
+        self.settings.setValue("clean_shutdown", True)
+        
         super().closeEvent(event)
 
     def jump_to_unit(self, row_index):
