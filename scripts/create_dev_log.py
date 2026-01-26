@@ -3,15 +3,29 @@ import sys
 import datetime
 import argparse
 
-# Configuration
-LOG_ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "local_dev_logs")
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_PROCESS_ROOT = os.path.join(REPO_ROOT, "_process_docs")
+DEFAULT_DEVLOG_ROOT = os.path.join(DEFAULT_PROCESS_ROOT, "30_DEVLOGS")
+
+def resolve_dev_log_root() -> str:
+    direct = os.environ.get("XLIFF_DEV_LOG_ROOT")
+    if direct:
+        return os.path.abspath(direct)
+
+    process_root = os.environ.get("XLIFF_PROCESS_ROOT")
+    if process_root:
+        return os.path.join(os.path.abspath(process_root), "30_DEVLOGS")
+
+    return DEFAULT_DEVLOG_ROOT
+
+LOG_ROOT = resolve_dev_log_root()
 TEMPLATE_PATH = os.path.join(LOG_ROOT, "templates", "dev_log_template.md")
 
 CATEGORIES = {
-    "feature": "feature_logs",
-    "bugfix": "bugfix_logs",
-    "refactor": "feature_logs", # Refactors often go with features or can be separate
-    "docs": "feature_logs"      # Docs treated as features usually
+    "feature": os.path.join("feature", "logs"),
+    "bugfix": os.path.join("bugfix", "logs"),
+    "refactor": os.path.join("refactor", "logs"),
+    "docs": os.path.join("docs", "logs")
 }
 
 def load_template():
@@ -53,7 +67,7 @@ def create_log(title, category, summary="Task Summary", reason="User Request"):
         
     filename = f"LOG-{date_str}-{safe_title}.md"
     
-    subdir = CATEGORIES.get(category.lower(), "feature_logs")
+    subdir = CATEGORIES.get(category.lower(), os.path.join("feature", "logs"))
     target_dir = os.path.join(LOG_ROOT, subdir)
     
     if not os.path.exists(target_dir):
