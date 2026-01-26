@@ -2,16 +2,17 @@ import sys
 import os
 import time
 import difflib
-import re # Native regex for stability
+import tempfile # For atomic save
+import shutil # For atomic save
 import qdarktheme # Modern theme
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QTableView, QFileDialog, 
                              QHeaderView, QMessageBox, QLabel, QAbstractItemView,
                              QComboBox, QLineEdit, QGroupBox, QMenu, QDockWidget,
                              QTextEdit, QProgressBar, QSplitter, QFrame, QCheckBox,
-                             QToolBar, QSpacerItem, QSizePolicy, QTabWidget, QDialog)
+                             QToolBar, QSpacerItem, QSizePolicy, QTabWidget, QDialog, QToolButton)
 from PyQt6.QtCore import (Qt, QAbstractTableModel, QModelIndex, QThread, pyqtSignal, 
-                          QSize, QSettings, QSortFilterProxyModel, QRegularExpression, QTimer)
+                          QSize, QSettings, QSortFilterProxyModel, QRegularExpression, QTimer, QEvent)
 from PyQt6.QtGui import QAction, QIcon, QColor, QBrush, QKeySequence, QShortcut
 
 # Ensure core modules importable
@@ -25,6 +26,7 @@ from core.qa import QAChecker
 from core.repair import RepairWorker
 from core.workers import TranslationWorker, RefineWorker, TestConnectionWorker, SampleWorker
 from core.profile import TranslationProfile, TranslationProfileContainer, ProfileStatus
+from core.autosave import Autosaver
 from ui.profile_wizard import ProfileWizardDialog, WizardResult
 from ai.client import LLMClient
 import json # Added missing import
@@ -214,16 +216,22 @@ class XliffFilterProxyModel(QSortFilterProxyModel):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("XLIFF AI Assistant Pro v2.0")
+        self.setWindowTitle("XLIFF AI Assistant Pro v2.0 [*]") # Support dirty indicator
         self.resize(1400, 900)
         
         # Settings
         self.settings = QSettings("Gemini", "XLIFF_AI_Assistant")
         
+        # State Flags
+        self.is_dirty = False # Tracks unsaved changes for Close Prompt
+        
         # Data
         self.parser = None
         self.units = []
         self.abstractor = TagAbstractor()
+        
+        # Autosave
+        self.autosaver = None
         
         # Profile Management
         self.current_profile = None # TranslationProfile
@@ -248,6 +256,199 @@ class MainWindow(QMainWindow):
         self.setup_ui()
         self.load_settings()
         self.apply_styles()
+        
+        # Connect autosave to data changes (Universal Autosave)
+        self.model.dataChanged.connect(lambda: self.perform_autosave())
+        
+        # Suggestion Bar (Hidden by default)
+        self.suggestion_bar = QFrame()
+        self.suggestion_bar.setObjectName("suggestionBar")
+        self.suggestion_bar.setStyleSheet("""
+            QFrame#suggestionBar {
+                background-color: #FFF3CD;
+                border-bottom: 1px solid #FFECB3;
+                padding: 10px;
+            }
+            QLabel { color: #856404; font-weight: bold; }
+        """)
+        self.suggestion_bar.setVisible(False)
+        
+        # Insert Suggestion Bar into Main Layout (Above Tabs)
+        # We need to access the central widget layout
+        # The central widget is 'central_container' from setup_ui
+        # But we don't have reference to layout there.
+        # Let's fix setup_ui to store the layout or insert it here if possible.
+        # Actually, let's just create it in setup_ui to be clean.
+        
+        # Post-init: Check for crash recovery
+        # Using singleShot to let the main loop start and UI show up first
+        QTimer.singleShot(100, self.check_crash_recovery)
+
+    def check_crash_recovery(self):
+        """Check if app was closed unexpectedly and prompt for recovery."""
+        try:
+            clean_shutdown = self.settings.value("clean_shutdown", True, type=bool)
+            last_active = self.settings.value("last_active_file", "")
+            last_opened = self.settings.value("last_opened_file", "")
+            last_fingerprint = self.settings.value("last_file_fingerprint", "")
+            
+            logger.info(f"Startup Check: Clean={clean_shutdown}, LastActive={last_active}, LastOpened={last_opened}")
+            
+            # Reset clean shutdown flag immediately and SYNC to disk
+            self.settings.setValue("clean_shutdown", False)
+            self.settings.sync()
+            
+            # Priority 1: Crash Recovery
+            if not clean_shutdown and last_active and os.path.exists(last_active):
+                logger.info(f"Unexpected shutdown detected. Last active file: {last_active}")
+                
+                # Verify fingerprint to avoid loading corrupted/externally changed files blindly
+                current_fingerprint = Autosaver.calculate_file_fingerprint(last_active)
+                if current_fingerprint != last_fingerprint:
+                    logger.warning("Last active file has changed externally. Skipping auto-resume.")
+                    QMessageBox.warning(self, "Session Resume Skipped", 
+                        f"The file '{os.path.basename(last_active)}' was modified externally after the crash.\n\nCrash recovery aborted to prevent data corruption.")
+                    return
+
+                # Check for autosave
+                autosave_path = Autosaver._get_autosave_path(last_active)
+                has_autosave = os.path.exists(autosave_path)
+                
+                if has_autosave:
+                    # MERGED DIALOG: "Recover & Open", "Open Original", "Cancel"
+                    box = QMessageBox(self)
+                    box.setWindowTitle("Crash Recovery")
+                    box.setText(f"Application closed unexpectedly while editing '{os.path.basename(last_active)}'.\n\nUnsaved progress found.")
+                    box.setIcon(QMessageBox.Icon.Warning)
+                    
+                    btn_recover = box.addButton("Recover & Open", QMessageBox.ButtonRole.AcceptRole)
+                    btn_open = box.addButton("Open Original", QMessageBox.ButtonRole.ActionRole)
+                    btn_cancel = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+                    
+                    box.exec()
+                    
+                    if box.clickedButton() == btn_recover:
+                        self.load_file(last_active, auto_recover=True)
+                    elif box.clickedButton() == btn_open:
+                        self.load_file(last_active, auto_recover=False)
+                    else:
+                        pass # Cancel
+                else:
+                    # Simple "Resume" Prompt
+                    reply = QMessageBox.question(self, "Resume Session", 
+                        f"Application closed unexpectedly.\n\nReopen '{os.path.basename(last_active)}'?",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                    
+                    if reply == QMessageBox.StandardButton.Yes:
+                        self.load_file(last_active, auto_recover=False)
+            
+            # Priority 2: Normal Resume (Open Last File)
+            elif last_opened and os.path.exists(last_opened):
+                # Only ask if we didn't just crash
+                reply = QMessageBox.question(self, "Open Last File", 
+                    f"Do you want to reopen '{os.path.basename(last_opened)}'?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                
+                if reply == QMessageBox.StandardButton.Yes:
+                    self.load_file(last_opened)
+
+        except Exception as e:
+            logger.error(f"Error in crash recovery check: {e}")
+
+    def load_file(self, path, auto_recover=False):
+        """
+        Internal method to load a file.
+        :param path: Absolute path to XLIFF file
+        :param auto_recover: If True, automatically apply autosave without prompt
+        """
+        try:
+            # 1. Load Data
+            self.parser = XliffParser(path)
+            self.parser.load()
+            raw_units = self.parser.get_translation_units()
+            self.units = []
+            for u in raw_units:
+                res = self.abstractor.abstract(u.source_raw)
+                u.source_abstracted = res.abstracted_text
+                u.tags_map = res.tags_map
+                
+                if u.target_raw:
+                    res_tgt = self.abstractor.abstract(u.target_raw)
+                    u.target_abstracted = res_tgt.abstracted_text
+                
+                self.units.append(u)
+            
+            # 2. Update UI
+            self.model.update_data(self.units)
+            self.proxy_model.invalidate()
+            self.proxy_qa.invalidate()
+            self.view_qa.setModel(self.proxy_qa)
+            
+            # Format headers
+            for v in [self.table, self.view_qa]:
+                h = v.horizontalHeader()
+                h.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents) 
+                h.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents) 
+                h.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents) 
+                h.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents) 
+                h.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch) 
+                h.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch) 
+                h.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch) 
+            
+            self.update_stats()
+            
+            # 3. Load Profile
+            self.load_profile_for_file(path)
+            
+            # 4. Session Tracking
+            self.settings.setValue("last_active_file", path) # For crash recovery
+            self.settings.setValue("last_opened_file", path) # For normal resume
+            self.settings.setValue("last_file_fingerprint", Autosaver.calculate_file_fingerprint(path))
+            self.settings.sync() # Force persist immediately
+            
+            # 5. Autosave Init & Recovery
+            self.init_autosave(path, auto_recover=auto_recover)
+            
+            # Reset dirty flag after load
+            self.is_dirty = False 
+            self.setWindowModified(False)
+            
+        except Exception as e:
+            logger.error(f"Failed to load file: {e}", exc_info=True)
+            QMessageBox.critical(self, "Error", str(e))
+
+    def open_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Open XLIFF", "", "XLIFF (*.xlf *.xliff)")
+        if path:
+            self.load_file(path)
+
+    def init_autosave(self, file_path, auto_recover=False):
+        """Initialize autosaver and check for crash recovery"""
+        self.autosaver = Autosaver(file_path)
+        
+        recovery_data = self.autosaver.check_recovery_available()
+        if recovery_data:
+            if auto_recover:
+                # Apply silently
+                self.apply_recovery(recovery_data)
+                return
+
+            ts = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(recovery_data['timestamp']))
+            count = recovery_data.get('count', 0)
+            
+            reply = QMessageBox.question(
+                self, "Crash Recovery", 
+                f"Found unsaved progress from {ts}.\n\n"
+                f"Recover {count} segments?\n\n"
+                "(Yes to recover, No to discard)",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            
+            if reply == QMessageBox.StandardButton.Yes:
+                self.apply_recovery(recovery_data)
+            else:
+                # User chose to discard
+                self.autosaver.cleanup()
 
     def setup_ui(self):
         # Central Widget is now a TabWidget
@@ -298,6 +499,28 @@ class MainWindow(QMainWindow):
         bc_layout.addWidget(self.btn_edit_brief)
         
         central_layout.addWidget(self.brief_card)
+        
+        # Suggestion Bar (Created in init, added here)
+        if hasattr(self, 'suggestion_bar'):
+            central_layout.addWidget(self.suggestion_bar)
+            
+            # Setup Layout for Suggestion Bar
+            sb_layout = QHBoxLayout(self.suggestion_bar)
+            self.lbl_suggestion = QLabel("Suggestion Message")
+            sb_layout.addWidget(self.lbl_suggestion)
+            
+            self.btn_suggestion_action = QPushButton("Action")
+            self.btn_suggestion_action.setStyleSheet("background-color: #FFC107; color: black; border: none; padding: 5px 10px;")
+            sb_layout.addWidget(self.btn_suggestion_action)
+            
+            sb_layout.addStretch()
+            
+            btn_dismiss = QPushButton("✕")
+            btn_dismiss.setFixedSize(24, 24)
+            btn_dismiss.setFlat(True)
+            btn_dismiss.clicked.connect(lambda: self.suggestion_bar.setVisible(False))
+            sb_layout.addWidget(btn_dismiss)
+            
         central_layout.addWidget(self.tabs)
         
         self.setCentralWidget(central_container)
@@ -414,7 +637,13 @@ class MainWindow(QMainWindow):
         self.btn_open.clicked.connect(self.open_file)
         top_bar.addWidget(self.btn_open)
         
-        self.btn_save = QPushButton("💾 Export")
+        # Save (Overwrite)
+        self.btn_save_overwrite = QPushButton("💾 Save")
+        self.btn_save_overwrite.setToolTip("Save changes to current file (Ctrl+S)")
+        self.btn_save_overwrite.clicked.connect(self.save_current_file)
+        top_bar.addWidget(self.btn_save_overwrite)
+        
+        self.btn_save = QPushButton("📤 Export") # Renamed from Save to Export
         self.btn_save.clicked.connect(self.save_file)
         top_bar.addWidget(self.btn_save)
         
@@ -470,10 +699,11 @@ class MainWindow(QMainWindow):
         
         top_bar.addStretch()
         
-        # Theme Toggle (Small)
-        self.btn_theme = QPushButton("🌓")
-        self.btn_theme.setFixedSize(30, 30)
+        # Theme Toggle (Icon only)
+        self.btn_theme = QToolButton()
+        self.btn_theme.setToolTip("Toggle Theme")
         self.btn_theme.clicked.connect(self.toggle_theme)
+        # Icon size handled by style or system
         top_bar.addWidget(self.btn_theme)
         
         layout.addLayout(top_bar)
@@ -511,21 +741,28 @@ class MainWindow(QMainWindow):
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self.show_context_menu)
-        self.table.selectionModel().selectionChanged.connect(self.on_selection_changed)
+        self.table.selectionModel().currentChanged.connect(self.on_current_row_changed)
+        
+        # Row Height Optimization
+        self.table.setWordWrap(True)
+        self.table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+        self.table.verticalHeader().setDefaultSectionSize(40) # Default compact height
+        self.table.setMouseTracking(True) # Enable hover tracking
+        self.table.entered.connect(self.on_table_hover)
         
         # Shortcuts
         QShortcut(QKeySequence("Ctrl+Up"), self.table, lambda: self.navigate_grid(-1))
         QShortcut(QKeySequence("Ctrl+Down"), self.table, lambda: self.navigate_grid(1))
+        QShortcut(QKeySequence("Ctrl+S"), self, self.save_current_file) # Save Shortcut
         
         # Table Headers
         h = self.table.horizontalHeader()
-        h.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents) # ID
-        h.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents) # State
-        h.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents) # Tags
-        h.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents) # QA
-        h.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch) # Details (Errors)
-        h.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch) # Source
-        h.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch) # Target
+        h.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        h.customContextMenuRequested.connect(self.show_header_context_menu)
+        h.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        
+        # Default Widths (Init)
+        # We will load persisted widths in load_file or a separate method
         
         layout.addWidget(self.table)
 
@@ -724,6 +961,8 @@ class MainWindow(QMainWindow):
             text_col = "#E8EAED"
             primary_col = "#007AFF"
             title_col = "#60CDFF"
+            theme_icon = "🌙"
+            theme_tip = "Switch to Light Mode"
         else:
             bg_sidebar = "#F1F3F4" # Light gray
             bg_filter = "#FFFFFF"
@@ -731,6 +970,8 @@ class MainWindow(QMainWindow):
             text_col = "#202124"
             primary_col = "#1A73E8"
             title_col = "#1967D2"
+            theme_icon = "🌞"
+            theme_tip = "Switch to Dark Mode"
 
         self.setStyleSheet(f"""
             QLabel#appTitle {{ font-size: 24px; font-weight: bold; color: {title_col}; margin-bottom: 20px; }}
@@ -742,8 +983,9 @@ class MainWindow(QMainWindow):
             QTextEdit {{ font-family: Consolas, monospace; font-size: 13px; }}
         """)
         
-        # Update button text
-        self.btn_theme.setText("🌞 Light Mode" if theme == "dark" else "🌙 Dark Mode")
+        # Update button text/icon
+        self.btn_theme.setText(theme_icon)
+        self.btn_theme.setToolTip(theme_tip)
 
     # --- Settings persistence ---
     def load_settings(self):
@@ -854,22 +1096,142 @@ class MainWindow(QMainWindow):
                 # Format headers for both tables
                 for v in [self.table, self.view_qa]:
                     h = v.horizontalHeader()
-                    h.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents) # ID
-                    h.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents) # State
-                    h.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents) # Tags
-                    h.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents) # QA
-                    h.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch) # Details
-                    h.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch) # Source
-                    h.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch) # Target
+                    if v == self.view_qa:
+                        h.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+                        h.setStretchLastSection(True)
+                    else:
+                        # Main Table: Restore column state
+                        self.restore_column_state()
                 
                 self.update_stats()
                 
                 # 3. Load Profile (Sidecar Logic)
                 self.load_profile_for_file(path)
                 
+                # 4. Autosave Init & Recovery Check
+                self.init_autosave(path)
+                
             except Exception as e:
                 logger.error(f"Failed to open file: {e}", exc_info=True)
                 QMessageBox.critical(self, "Error", str(e))
+
+    def init_autosave(self, file_path):
+        """Initialize autosaver and check for crash recovery"""
+        self.autosaver = Autosaver(file_path)
+        
+        recovery_data = self.autosaver.check_recovery_available()
+        if recovery_data:
+            ts = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(recovery_data['timestamp']))
+            count = recovery_data.get('count', 0)
+            
+            reply = QMessageBox.question(
+                self, "Crash Recovery", 
+                f"Found unsaved progress from {ts}.\n\n"
+                f"Recover {count} segments?\n\n"
+                "(Yes to recover, No to discard)",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            
+            if reply == QMessageBox.StandardButton.Yes:
+                self.apply_recovery(recovery_data)
+            else:
+                # User chose to discard
+                self.autosaver.cleanup()
+
+    def apply_recovery(self, data):
+        """Apply patch from autosave to current model"""
+        try:
+            updates = data.get("units", {})
+            applied_count = 0
+            
+            for u in self.units:
+                if u.id in updates:
+                    patch = updates[u.id]
+                    u.target_abstracted = patch['target']
+                    u.state = patch['state']
+                    applied_count += 1
+            
+            self.model.layoutChanged.emit()
+            self.update_stats()
+            logger.info(f"Recovered {applied_count} segments from autosave.")
+            QMessageBox.information(self, "Recovery Complete", f"Successfully restored {applied_count} segments.")
+            
+        except Exception as e:
+            logger.error(f"Recovery failed: {e}")
+            QMessageBox.critical(self, "Recovery Failed", str(e))
+
+    def perform_autosave(self):
+        """Trigger an atomic autosave of current progress"""
+        if not self.is_dirty:
+            self.is_dirty = True
+            self.setWindowModified(True)
+            
+        if self.autosaver:
+            # We save everything, let Autosaver filter inside
+            # Run in main thread to ensure data consistency (it's fast JSON dump)
+            self.autosaver.save_patch(self.units)
+
+    def atomic_save_file(self, target_path):
+        """
+        Atomic save implementation: Write to temp -> Move to target
+        Uses QSaveFile logic (simulated with tempfile+shutil for Pythonic simplicity/robustness)
+        """
+        try:
+            # 1. Update targets in parser (memory)
+            for u in self.units:
+                if u.target_abstracted:
+                    try:
+                        u.target_raw = self.abstractor.reconstruct(u.target_abstracted, u.tags_map)
+                    except Exception as e:
+                        logger.warning(f"Tag reconstruction failed for unit {u.id}: {e}")
+            
+            # 2. Write to temp file first
+            dir_name = os.path.dirname(target_path)
+            with tempfile.NamedTemporaryFile(mode='w', dir=dir_name, delete=False, encoding='utf-8') as tf:
+                # We use parser's save logic but redirect to temp file
+                # Need to inspect parser.update_targets to see if it accepts a stream or path
+                # Assuming it takes a path.
+                temp_name = tf.name
+            
+            # Re-use parser's logic to write to the TEMP path
+            self.parser.update_targets(self.units, temp_name)
+            
+            # 3. Atomic Move (Replace)
+            if os.path.exists(target_path):
+                os.remove(target_path) # Required on Windows before rename usually, or use replace
+            
+            os.replace(temp_name, target_path)
+            
+            return True
+        except Exception as e:
+            logger.error(f"Atomic save failed: {e}")
+            if 'temp_name' in locals() and os.path.exists(temp_name):
+                os.remove(temp_name)
+            raise e
+
+    def save_current_file(self):
+        """Save changes to the current file (Ctrl+S)"""
+        if not self.units or not self.parser or not self.parser.file_path:
+            return
+            
+        try:
+            # Atomic Write
+            self.atomic_save_file(self.parser.file_path)
+            
+            # Success Handling
+            self.is_dirty = False
+            self.setWindowModified(False)
+            if self.autosaver:
+                self.autosaver.cleanup()
+                
+            # Update fingerprint
+            self.settings.setValue("last_file_fingerprint", Autosaver.calculate_file_fingerprint(self.parser.file_path))
+            self.settings.sync()
+            
+            QTimer.singleShot(0, lambda: QMessageBox.information(self, "Saved", f"Successfully saved to disk."))
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Save Failed", f"Could not save file:\n{e}")
 
     def update_profile_status_ui(self):
         if not self.current_profile:
@@ -925,10 +1287,19 @@ class MainWindow(QMainWindow):
         
         self.lbl_brief_details.setText("<br>".join(details))
 
+    def calculate_source_fingerprint(self):
+        """Calculate a hash of the abstract source content to detect file changes."""
+        import hashlib
+        content = "".join([u.source_abstracted for u in self.units if u.source_abstracted])
+        return hashlib.md5(content.encode('utf-8')).hexdigest()
+
     def load_profile_for_file(self, xliff_path):
         """Loads profile from sidecar or creates a new one with Wizard"""
         # Sidecar path: file.xlf -> file.profile.json
         self.current_sidecar_path = f"{xliff_path}.profile.json"
+        
+        # Calculate current fingerprint
+        current_fingerprint = self.calculate_source_fingerprint()
         
         if os.path.exists(self.current_sidecar_path):
             try:
@@ -945,13 +1316,44 @@ class MainWindow(QMainWindow):
             # Create new default
             self.current_profile = TranslationProfile()
             
-        # Check Status
-        if self.current_profile.controls.status == ProfileStatus.NEW:
-            # Launch Wizard
-            self.launch_profile_wizard()
+        # Decision Logic: To popup or not to popup
+        status = self.current_profile.controls.status
+        saved_fingerprint = self.current_profile.controls.source_fingerprint
         
+        # 1. NEW Profile (No Sidecar) -> Auto Popup
+        if status == ProfileStatus.NEW:
+            self.launch_profile_wizard()
+            
+        # 2. CONFIRMED but Mismatch -> Suggestion Bar
+        elif status == ProfileStatus.CONFIRMED:
+            if saved_fingerprint and saved_fingerprint != current_fingerprint:
+                self.show_suggestion(
+                    "Source file has changed since last profile setup.",
+                    "Review Profile",
+                    self.launch_profile_wizard
+                )
+            else:
+                self.suggestion_bar.setVisible(False)
+                
+        # 3. DRAFT (Skipped) -> Suggestion Bar
+        elif status == ProfileStatus.DRAFT:
+            self.show_suggestion(
+                "Profile setup is incomplete (Draft).",
+                "Resume Wizard",
+                self.launch_profile_wizard
+            )
+            
         # Always update UI
         self.update_profile_status_ui()
+
+    def show_suggestion(self, message, action_text, action_callback):
+        self.lbl_suggestion.setText(message)
+        self.btn_suggestion_action.setText(action_text)
+        try:
+            self.btn_suggestion_action.clicked.disconnect()
+        except: pass
+        self.btn_suggestion_action.clicked.connect(lambda: (self.suggestion_bar.setVisible(False), action_callback()))
+        self.suggestion_bar.setVisible(True)
 
     def launch_profile_wizard(self):
         if not self.current_profile: return
@@ -961,18 +1363,18 @@ class MainWindow(QMainWindow):
             # Accepted
             self.current_profile = dlg.get_profile()
             self.current_profile.controls.status = ProfileStatus.CONFIRMED
+            self.current_profile.controls.source_fingerprint = self.calculate_source_fingerprint()
             self.save_profile()
             logger.info("Profile configured and saved.")
+            self.suggestion_bar.setVisible(False)
         else:
             if dlg.result_code == WizardResult.SKIPPED:
-                # User skipped - keep as NEW or DRAFT but don't save to disk yet
-                logger.info("Profile setup skipped.")
-                # Optional: Set status to DRAFT so we don't annoy user immediately again?
-                # Or keep NEW so it asks again next time.
-                self.lbl_profile_status.setText("Profile: Temporary (Default)")
-                pass
+                logger.info("Profile setup skipped. Keeping profile as NEW.")
+                self.current_profile.controls.status = ProfileStatus.NEW
+                self.current_profile.controls.source_fingerprint = ""
+                self.suggestion_bar.setVisible(False)
             else:
-                # Cancelled - do nothing (or close file?)
+                # Cancelled - do nothing (keep current state)
                 pass
         
         self.update_profile_status_ui()
@@ -1054,6 +1456,7 @@ class MainWindow(QMainWindow):
             profile=self.current_profile # Pass Profile
         )
         self.trans_worker.progress.connect(lambda c, t: self.progress.setValue(int(c/t*100)))
+        self.trans_worker.progress.connect(lambda c, t: self.perform_autosave())
         self.trans_worker.finished.connect(self.on_trans_finished)
         self.trans_worker.error.connect(lambda e: QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Error", e)))
         self.trans_worker.start()
@@ -1135,15 +1538,132 @@ class MainWindow(QMainWindow):
         
         dlg.exec()
 
-    def on_selection_changed(self, selected, deselected):
-        indexes = self.table.selectionModel().selectedRows()
-        if len(indexes) == 1:
-            proxy_idx = indexes[0]
+    def on_current_row_changed(self, current, previous):
+        """Handle row selection change: Expand current, collapse previous."""
+        if previous.isValid():
+            self.table.setRowHeight(previous.row(), 40) # Restore default
+            
+        if current.isValid():
+            # Auto-expand
+            self.table.resizeRowToContents(current.row())
+            
+            # Update Refine Dock
+            proxy_idx = current
             source_idx = self.proxy_model.mapToSource(proxy_idx)
             self.update_ui_for_unit(source_idx.row())
         else:
             self.dock_refine.setVisible(False)
             self.active_unit_index_map = -1
+
+    def on_table_hover(self, index):
+        """
+        Handle mouse hover: Expand hovered row temporarily.
+        Uses a debounce timer to prevent jitter/flickering when moving rapidly across rows.
+        """
+        # Initialize timer if needed
+        if not hasattr(self, '_hover_timer'):
+            self._hover_timer = QTimer(self)
+            self._hover_timer.setSingleShot(True)
+            self._hover_timer.timeout.connect(self._apply_hover_resize)
+
+        row = index.row()
+        current_row = self.table.currentIndex().row()
+        
+        # If we are already hovering this row (and it's processed), do nothing
+        if hasattr(self, '_last_hover_row') and self._last_hover_row == row:
+            return
+
+        # Stop any pending resize for a different row
+        self._hover_timer.stop()
+        
+        # Store target and start debounce
+        self._hover_target_index = index
+        self._hover_timer.start(100) # 100ms delay for smoothness
+
+    def _apply_hover_resize(self):
+        """Execute the actual row resizing after debounce delay"""
+        if not hasattr(self, '_hover_target_index') or not self._hover_target_index.isValid():
+            return
+            
+        index = self._hover_target_index
+        row = index.row()
+        current_row = self.table.currentIndex().row()
+        
+        last_hover = getattr(self, '_last_hover_row', -1)
+        
+        # 1. Expand NEW row first (Stability: Ensure target exists before shifting others)
+        if row != current_row:
+            self.table.resizeRowToContents(row)
+            # Enforce minimum height to prevent "collapsing" empty rows
+            if self.table.rowHeight(row) < 40:
+                self.table.setRowHeight(row, 40)
+            self._last_hover_row = row
+        else:
+            self._last_hover_row = -1
+            
+        # 2. Shrink OLD row (after new one is stable)
+        if last_hover != -1 and last_hover != current_row and last_hover != row:
+            self.table.setRowHeight(last_hover, 40)
+
+    def leaveEvent(self, event):
+        """Restore hover row when leaving window/table area"""
+        # Stop any pending hover action
+        if hasattr(self, '_hover_timer'):
+            self._hover_timer.stop()
+            
+        if hasattr(self, '_last_hover_row') and self._last_hover_row != -1:
+            if self._last_hover_row != self.table.currentIndex().row():
+                self.table.setRowHeight(self._last_hover_row, 40)
+            self._last_hover_row = -1
+        super().leaveEvent(event)
+
+    def show_header_context_menu(self, pos):
+        """Right-click on header to toggle columns."""
+        menu = QMenu(self)
+        header = self.table.horizontalHeader()
+        
+        for i in range(self.model.columnCount()):
+            name = self.model.headerData(i, Qt.Orientation.Horizontal, Qt.ItemDataRole.DisplayRole)
+            action = QAction(name, self, checkable=True)
+            action.setChecked(not header.isSectionHidden(i))
+            action.triggered.connect(lambda checked, col=i: self.toggle_column(col, checked))
+            menu.addAction(action)
+            
+        menu.exec(header.mapToGlobal(pos))
+
+    def toggle_column(self, col, visible):
+        if visible:
+            self.table.showColumn(col)
+        else:
+            self.table.hideColumn(col)
+        self.save_column_state()
+
+    def save_column_state(self):
+        header = self.table.horizontalHeader()
+        state = header.saveState()
+        self.settings.setValue("table_column_state", state)
+
+    def restore_column_state(self):
+        state = self.settings.value("table_column_state")
+        if state:
+            self.table.horizontalHeader().restoreState(state)
+        else:
+            # Default Layout
+            self.table.setColumnWidth(0, 50) # ID
+            self.table.setColumnWidth(1, 50) # State
+            self.table.setColumnWidth(2, 80) # Tags
+            self.table.setColumnWidth(3, 50) # QA
+            self.table.setColumnHidden(2, True) # Hide Tags by default
+            self.table.setColumnHidden(4, True) # Hide Details by default
+            
+            # Source/Target split remaining
+            width = self.table.width() - 250
+            self.table.setColumnWidth(5, int(width * 0.45))
+            self.table.setColumnWidth(6, int(width * 0.45))
+
+    def on_selection_changed(self, selected, deselected):
+        # Deprecated: Replaced by on_current_row_changed
+        pass
 
     def on_qa_selection_changed(self, selected, deselected):
         indexes = self.view_qa.selectionModel().selectedRows()
@@ -1298,12 +1818,35 @@ class MainWindow(QMainWindow):
                 clip.setText(text)
 
         elif action == action_clear:
-            for u in selected_units:
-                if u.state == "locked": continue
-                u.target_abstracted = ""
-                u.state = "needs_translation"
-            self.model.layoutChanged.emit()
-            self.update_stats()
+            try:
+                # 1. Show Wait Cursor
+                QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+                
+                # 2. Batch Update
+                # Temporarily block signals if needed, but layoutChanged is enough
+                changed_count = 0
+                for u in selected_units:
+                    if u.state == "locked": continue
+                    # Only change if not empty
+                    if u.target_abstracted:
+                        u.target_abstracted = ""
+                        u.state = "needs_translation"
+                        changed_count += 1
+                
+                if changed_count > 0:
+                    # 3. Refresh UI
+                    self.model.layoutChanged.emit()
+                    self.update_stats()
+                    
+                    # 4. Autosave (CRITICAL)
+                    self.perform_autosave()
+                    logger.info(f"Cleared {changed_count} segments.")
+                
+            except Exception as e:
+                logger.error(f"Error clearing targets: {e}")
+                QMessageBox.critical(self, "Error", f"Failed to clear targets: {e}")
+            finally:
+                QApplication.restoreOverrideCursor()
         
     def run_qa(self, silent=False):
         if not self.units: return
@@ -1445,6 +1988,17 @@ class MainWindow(QMainWindow):
                     except Exception as e:
                         logger.warning(f"Tag reconstruction failed for unit {u.id}: {e}")
             self.parser.update_targets(self.units, path)
+            
+            # Cleanup autosave on successful export
+            if self.autosaver:
+                self.autosaver.cleanup()
+            
+            # Remove "active file" on successful export/save? 
+            # No, user might keep editing. 
+            # But maybe we update the fingerprint because file changed?
+            # Yes, file on disk changed, so fingerprint changed.
+            self.settings.setValue("last_file_fingerprint", Autosaver.calculate_file_fingerprint(path))
+                
             logger.info(f"File exported to: {path}")
             QMessageBox.information(self, "Saved", f"Exported to {path}")
 
@@ -1536,7 +2090,74 @@ class MainWindow(QMainWindow):
         self.jump_to_unit(row)
 
     def closeEvent(self, event):
-        """Save settings on exit"""
+        """Handle exit: Check for running tasks, unsaved changes and persist settings."""
+        logger.info(f"Close event triggered. Dirty: {self.is_dirty}")
+        
+        # 1. Check for Running Workers (Priority over Dirty)
+        running_tasks = []
+        if self.trans_worker and self.trans_worker.isRunning():
+            running_tasks.append("Translation")
+        if self.repair_worker and self.repair_worker.isRunning():
+            running_tasks.append("Batch Repair")
+            
+        if running_tasks:
+            task_str = " and ".join(running_tasks)
+            reply = QMessageBox.question(self, "Tasks in Progress", 
+                f"{task_str} is currently running.\n\n"
+                "Force Quit will abort these tasks.\n"
+                "Are you sure you want to exit?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+                
+            if reply == QMessageBox.StandardButton.No:
+                event.ignore()
+                return
+            else:
+                # User chose to Force Quit
+                # Stop workers if possible (cleaner exit)
+                if self.trans_worker: self.trans_worker.stop()
+                # Repair worker might not have stop(), but thread kill is implicit on app exit
+                pass
+
+        # 2. Check Dirty State
+        if self.is_dirty:
+            box = QMessageBox(self)
+            box.setWindowTitle("Unsaved Changes")
+            box.setText("You have unsaved changes. Do you want to save them?")
+            box.setIcon(QMessageBox.Icon.Question)
+            
+            btn_save = box.addButton("Save", QMessageBox.ButtonRole.AcceptRole)
+            btn_dont_save = box.addButton("Don't Save (Keep Recovery)", QMessageBox.ButtonRole.DestructiveRole)
+            btn_cancel = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+            
+            box.exec()
+            
+            clicked = box.clickedButton()
+            
+            if clicked == btn_cancel:
+                event.ignore()
+                return
+                
+            elif clicked == btn_save:
+                # Try to save
+                try:
+                    self.save_current_file()
+                    # If save failed (exception caught inside but maybe we should check is_dirty?), 
+                    # check if clean now
+                    if self.is_dirty: # Still dirty implies save failed or cancelled
+                        event.ignore()
+                        return
+                    # Save success -> Cleanup autosave handled in save_current_file
+                except:
+                    event.ignore()
+                    return
+
+            elif clicked == btn_dont_save:
+                # Don't Save -> But Keep Recovery means DO NOT clean autosave
+                # Just proceed to close. 
+                pass
+        
+        # Save settings on exit
         self.settings.setValue("source_lang", self.combo_src.currentText())
         self.settings.setValue("target_lang", self.combo_tgt.currentText())
         self.settings.setValue("provider", self.combo_provider.currentText())
@@ -1549,7 +2170,13 @@ class MainWindow(QMainWindow):
         self.settings.setValue("repair_base_url", self.txt_repair_base_url.text())
         self.settings.setValue("diagnostic_mode", self.chk_diagnostic.isChecked())
         self.settings.setValue("geometry", self.saveGeometry())
-        super().closeEvent(event)
+        
+        # Mark clean shutdown
+        self.settings.setValue("clean_shutdown", True)
+        self.settings.sync() # Force write to disk
+        
+        # Parent close
+        QMainWindow.closeEvent(self, event)
 
     def jump_to_unit(self, row_index):
         """Scroll to and select the unit in the main table"""
