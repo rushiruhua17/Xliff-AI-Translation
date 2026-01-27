@@ -2,6 +2,7 @@ import sys
 import os
 import time
 import difflib
+import re
 import tempfile # For atomic save
 import shutil # For atomic save
 import qdarktheme # Modern theme
@@ -12,7 +13,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QTextEdit, QProgressBar, QSplitter, QFrame, QCheckBox,
                              QToolBar, QSpacerItem, QSizePolicy, QTabWidget, QDialog, QToolButton)
 from PyQt6.QtCore import (Qt, QAbstractTableModel, QModelIndex, QThread, pyqtSignal, 
-                          QSize, QSettings, QSortFilterProxyModel, QRegularExpression, QTimer, QEvent)
+                          QSize, QSettings, QSortFilterProxyModel, QRegularExpression, QTimer, QEvent, QPersistentModelIndex)
 from PyQt6.QtGui import QAction, QIcon, QColor, QBrush, QKeySequence, QShortcut
 
 # Ensure core modules importable
@@ -24,10 +25,14 @@ from core.abstractor import TagAbstractor
 from core.logger import get_logger, setup_exception_hook
 from core.qa import QAChecker
 from core.repair import RepairWorker
-from core.workers import TranslationWorker, RefineWorker, TestConnectionWorker, SampleWorker
+from core.workers import TranslationWorker, RefineWorker, TestConnectionWorker, SampleWorker, WorkbenchWorker
 from core.profile import TranslationProfile, TranslationProfileContainer, ProfileStatus
 from core.autosave import Autosaver
+from core.settings_manager import SettingsManager
+from core.token_guard import TokenGuard
 from ui.profile_wizard import ProfileWizardDialog, WizardResult
+from ui.workbench_frame import AIWorkbenchFrame
+from ui.settings_dialog import SettingsDialog
 from ai.client import LLMClient
 import json # Added missing import
 
@@ -219,8 +224,10 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("XLIFF AI Assistant Pro v2.0 [*]") # Support dirty indicator
         self.resize(1400, 900)
         
-        # Settings
+        # Settings (UI State)
         self.settings = QSettings("Gemini", "XLIFF_AI_Assistant")
+        # Settings Manager (Business Logic)
+        self.settings_manager = SettingsManager()
         
         # State Flags
         self.is_dirty = False # Tracks unsaved changes for Close Prompt
@@ -252,6 +259,7 @@ class MainWindow(QMainWindow):
         self.refine_worker = None
         self.test_worker = None
         self.repair_worker = None
+        self.wb_worker = None
         
         self.setup_ui()
         self.load_settings()
@@ -273,15 +281,7 @@ class MainWindow(QMainWindow):
         """)
         self.suggestion_bar.setVisible(False)
         
-        # Insert Suggestion Bar into Main Layout (Above Tabs)
-        # We need to access the central widget layout
-        # The central widget is 'central_container' from setup_ui
-        # But we don't have reference to layout there.
-        # Let's fix setup_ui to store the layout or insert it here if possible.
-        # Actually, let's just create it in setup_ui to be clean.
-        
         # Post-init: Check for crash recovery
-        # Using singleShot to let the main loop start and UI show up first
         QTimer.singleShot(100, self.check_crash_recovery)
 
     def check_crash_recovery(self):
@@ -451,21 +451,34 @@ class MainWindow(QMainWindow):
                 self.autosaver.cleanup()
 
     def setup_ui(self):
-        # Central Widget is now a TabWidget
-        self.tabs = QTabWidget()
-        self.setCentralWidget(self.tabs)
+        # --- Main Layout Wrapper (Splitter) ---
+        self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.setCentralWidget(self.main_splitter)
         
-        # --- Translation Brief Card (Phase 3) ---
-        # A simple, always-visible card above the tabs or inside the main layout
-        # But QMainWindow central widget is occupied by tabs. 
-        # We can use a layout wrapper for central widget: VBox(BriefCard, Tabs)
-        
-        central_container = QWidget()
-        central_layout = QVBoxLayout(central_container)
+        # --- Left Pane: Main Application ---
+        self.left_container = QWidget()
+        central_layout = QVBoxLayout(self.left_container)
         central_layout.setContentsMargins(0,0,0,0)
         central_layout.setSpacing(0)
         
-        # Brief Card
+        self.tabs = QTabWidget() # Initialize Tabs
+        self.main_splitter.addWidget(self.left_container)
+        
+        # --- Right Pane: AI Workbench ---
+        self.workbench = AIWorkbenchFrame()
+        self.main_splitter.addWidget(self.workbench)
+        
+        # Initial State
+        self.workbench_visible = self.settings.value("workbench_visible", True, type=bool)
+        self.workbench.setVisible(self.workbench_visible)
+        
+        # Connect Signals
+        self.connect_workbench_signals()
+        
+        # Initialize Workbench Models
+        self.update_workbench_config()
+        
+        # --- Brief Card (Phase 3) ---
         self.brief_card = QFrame()
         self.brief_card.setObjectName("briefCard")
         self.brief_card.setStyleSheet("""
@@ -523,8 +536,6 @@ class MainWindow(QMainWindow):
             
         central_layout.addWidget(self.tabs)
         
-        self.setCentralWidget(central_container)
-        
         # --- Tab 1: Translate (Workbench) ---
         self.tab_translate = QWidget()
         self.setup_translate_tab()
@@ -535,96 +546,7 @@ class MainWindow(QMainWindow):
         self.setup_qa_tab()
         self.tabs.addTab(self.tab_qa, "🛡️ QA Review")
         
-        # --- Tab 3: Settings ---
-        self.tab_settings = QWidget()
-        self.setup_settings_tab()
-        self.tabs.addTab(self.tab_settings, "Settings")
-
-        # --- Refinement Dock (Right Drawer) ---
-        self.dock_refine = QDockWidget("✨ Workbench", self)
-        self.dock_refine.setAllowedAreas(Qt.DockWidgetArea.RightDockWidgetArea)
-        
-        dock_widget = QWidget()
-        dock_layout = QVBoxLayout(dock_widget)
-        
-        # Left: Source & Prompt
-        v_left = QVBoxLayout()
-        
-        h_src = QHBoxLayout()
-        h_src.addWidget(QLabel("Source Segment:"))
-        h_src.addStretch()
-        btn_copy_src = QPushButton("📋")
-        btn_copy_src.setFixedSize(24, 24)
-        btn_copy_src.setToolTip("Copy Source")
-        btn_copy_src.clicked.connect(lambda: QApplication.clipboard().setText(self.txt_source.toPlainText()))
-        h_src.addWidget(btn_copy_src)
-        v_left.addLayout(h_src)
-        
-        self.txt_source = QTextEdit()
-        self.txt_source.setReadOnly(True)
-        self.txt_source.setMinimumHeight(60)
-        v_left.addWidget(self.txt_source)
-        
-        v_left.addWidget(QLabel("Instruction:"))
-        h_actions = QHBoxLayout()
-        self.txt_prompt = QLineEdit()
-        self.txt_prompt.setPlaceholderText("e.g. 'Fix grammar', 'Make concise'")
-        self.txt_prompt.returnPressed.connect(self.refine_current_segment) # Enter to trigger
-        h_actions.addWidget(self.txt_prompt)
-        
-        self.btn_refine = QPushButton("✨ Refine")
-        self.btn_refine.clicked.connect(self.refine_current_segment)
-        h_actions.addWidget(self.btn_refine)
-        v_left.addLayout(h_actions)
-        
-        # Shortcuts
-        h_quick = QHBoxLayout()
-        for label, prompt in [("Formal", "Make it formal"), ("Concise", "Make it concise"), ("Fix Grammar", "Fix grammar errors")]:
-            btn = QPushButton(label)
-            btn.clicked.connect(lambda _, p=prompt: (self.txt_prompt.setText(p), self.refine_current_segment()))
-            h_quick.addWidget(btn)
-        h_quick.addStretch()
-        v_left.addLayout(h_quick)
-        
-        dock_layout.addLayout(v_left, 1)
-
-        # Right: Target & Diff
-        v_right = QVBoxLayout()
-        v_right.addWidget(QLabel("Translation (Preview/Diff):"))
-        
-        # Splitter for Diff and Edit to allow resizing
-        splitter_right = QSplitter(Qt.Orientation.Vertical)
-        
-        self.txt_diff = QTextEdit()
-        self.txt_diff.setReadOnly(True)
-        self.txt_diff.setMinimumHeight(40)
-        self.txt_diff.setPlaceholderText("Diff view will appear here...")
-        splitter_right.addWidget(self.txt_diff)
-        
-        self.txt_target_edit = QTextEdit() # Editable
-        self.txt_target_edit.setMinimumHeight(60)
-        splitter_right.addWidget(self.txt_target_edit)
-        
-        # Set initial sizes
-        splitter_right.setSizes([60, 100])
-        
-        v_right.addWidget(splitter_right)
-        
-        h_confirm = QHBoxLayout()
-        h_confirm.addStretch()
-        self.btn_apply = QPushButton("✅ Apply & Next (Ctrl+Enter)")
-        self.btn_apply.clicked.connect(self.apply_refinement)
-        self.btn_apply.setObjectName("btnPrimary")
-        QShortcut(QKeySequence("Ctrl+Return"), self, self.apply_refinement)
-        
-        h_confirm.addWidget(self.btn_apply)
-        v_right.addLayout(h_confirm)
-        
-        dock_layout.addLayout(v_right, 1)
-        
-        self.dock_refine.setWidget(dock_widget)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.dock_refine)
-        self.dock_refine.setVisible(False)
+        # Settings moved to Dialog
 
     def setup_translate_tab(self):
         layout = QVBoxLayout(self.tab_translate)
@@ -636,6 +558,17 @@ class MainWindow(QMainWindow):
         self.btn_open = QPushButton("📂 Open")
         self.btn_open.clicked.connect(self.open_file)
         top_bar.addWidget(self.btn_open)
+        
+        # Language Selectors
+        top_bar.addWidget(QLabel("Src:"))
+        self.combo_src = QComboBox()
+        self.combo_src.addItems(["zh-CN", "en", "ja", "de", "fr"])
+        top_bar.addWidget(self.combo_src)
+        
+        top_bar.addWidget(QLabel("Tgt:"))
+        self.combo_tgt = QComboBox()
+        self.combo_tgt.addItems(["en", "zh-CN", "ja", "de", "fr"])
+        top_bar.addWidget(self.combo_tgt)
         
         # Save (Overwrite)
         self.btn_save_overwrite = QPushButton("💾 Save")
@@ -698,9 +631,9 @@ class MainWindow(QMainWindow):
         top_bar.addWidget(self.lbl_stats)
         
         top_bar.addStretch()
-        
         # Theme Toggle (Icon only)
         self.btn_theme = QToolButton()
+        self.btn_theme.setText("🌗") # Default text to ensure visibility
         self.btn_theme.setToolTip("Toggle Theme")
         self.btn_theme.clicked.connect(self.toggle_theme)
         # Icon size handled by style or system
@@ -829,182 +762,64 @@ class MainWindow(QMainWindow):
         h.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         h.setStretchLastSection(True)
 
-    def setup_settings_tab(self):
-        layout = QVBoxLayout(self.tab_settings)
-        layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-        layout.setSpacing(20)
-        layout.setContentsMargins(40, 40, 40, 40)
-        
-        # LLM Config Group
-        grp_llm = QGroupBox("AI Configuration")
-        form_layout = QVBoxLayout()
-        
-        # Provider
-        h_prov = QHBoxLayout()
-        h_prov.addWidget(QLabel("Provider:"))
-        self.combo_provider = QComboBox()
-        self.combo_provider.addItems(["SiliconFlow", "OpenAI", "DeepSeek"])
-        self.combo_provider.currentTextChanged.connect(self.on_provider_changed)
-        h_prov.addWidget(self.combo_provider)
-        form_layout.addLayout(h_prov)
-        
-        # API Key
-        h_key = QHBoxLayout()
-        h_key.addWidget(QLabel("API Key:"))
-        self.txt_apikey = QLineEdit()
-        self.txt_apikey.setEchoMode(QLineEdit.EchoMode.Password)
-        self.txt_apikey.setPlaceholderText("sk-...")
-        h_key.addWidget(self.txt_apikey)
-        form_layout.addLayout(h_key)
-        
-        # Base URL
-        h_url = QHBoxLayout()
-        h_url.addWidget(QLabel("Base URL:"))
-        self.txt_base_url = QLineEdit()
-        self.txt_base_url.setPlaceholderText("https://api.openai.com/v1")
-        h_url.addWidget(self.txt_base_url)
-        form_layout.addLayout(h_url)
-        
-        # Model
-        h_model = QHBoxLayout()
-        h_model.addWidget(QLabel("Model:"))
-        self.txt_model = QLineEdit()
-        self.txt_model.setPlaceholderText("gpt-3.5-turbo")
-        h_model.addWidget(self.txt_model)
-        form_layout.addLayout(h_model)
-        
-        # Test Connection HTML Warning
-        self.btn_test_conn = QPushButton("📡 Test Connection")
-        self.btn_test_conn.clicked.connect(self.test_connection)
-        form_layout.addWidget(self.btn_test_conn)
+    def open_settings_dialog(self):
+        dlg = SettingsDialog(self)
+        dlg.settings_changed.connect(self.on_settings_changed)
+        dlg.exec()
+        self.update_workbench_config()
 
-        grp_llm.setLayout(form_layout)
-        layout.addWidget(grp_llm)
-        
-        # Language Config
-        grp_lang = QGroupBox("Language Defaults")
-        l_layout = QHBoxLayout()
-        self.combo_src = QComboBox()
-        self.combo_src.addItems(["zh-CN", "en", "ja", "de", "fr"])
-        self.combo_tgt = QComboBox()
-        self.combo_tgt.addItems(["en", "zh-CN", "ja", "de", "fr"])
-        l_layout.addWidget(QLabel("Source:"))
-        l_layout.addWidget(self.combo_src)
-        l_layout.addWidget(QLabel("Target:"))
-        l_layout.addWidget(self.combo_tgt)
-        grp_lang.setLayout(l_layout)
-        layout.addWidget(grp_lang)
-        
-        # Auto-Repair Config (Optional Feature)
-        grp_repair = QGroupBox("Auto-Repair (Optional)")
-        repair_layout = QVBoxLayout()
-        
-        # Enable Toggle
-        self.chk_auto_repair = QCheckBox("Enable Auto-Repair")
-        self.chk_auto_repair.setToolTip("Use a secondary AI model to automatically fix tag errors")
-        repair_layout.addWidget(self.chk_auto_repair)
-        
-        # Repair Model
-        h_repair_model = QHBoxLayout()
-        h_repair_model.addWidget(QLabel("Repair Model:"))
-        self.txt_repair_model = QLineEdit()
-        self.txt_repair_model.setPlaceholderText("deepseek-chat")
-        h_repair_model.addWidget(self.txt_repair_model)
-        repair_layout.addLayout(h_repair_model)
-        
-        # Repair API Key
-        h_repair_key = QHBoxLayout()
-        h_repair_key.addWidget(QLabel("Repair API Key:"))
-        self.txt_repair_apikey = QLineEdit()
-        self.txt_repair_apikey.setEchoMode(QLineEdit.EchoMode.Password)
-        self.txt_repair_apikey.setPlaceholderText("sk-... (Optional, uses main key if empty)")
-        h_repair_key.addWidget(self.txt_repair_apikey)
-        repair_layout.addLayout(h_repair_key)
-        
-        # Repair Base URL
-        h_repair_url = QHBoxLayout()
-        h_repair_url.addWidget(QLabel("Repair Base URL:"))
-        self.txt_repair_base_url = QLineEdit()
-        self.txt_repair_base_url.setPlaceholderText("https://api.deepseek.com")
-        h_repair_url.addWidget(self.txt_repair_base_url)
-        repair_layout.addLayout(h_repair_url)
-        
-        grp_repair.setLayout(repair_layout)
-        layout.addWidget(grp_repair)
-        
-        # System & Debug Group
-        grp_system = QGroupBox("System & Debug")
-        sys_layout = QVBoxLayout()
-        self.chk_diagnostic = QCheckBox("Enable Diagnostic Mode (Requires Restart)")
-        self.chk_diagnostic.setToolTip("Enables verbose logging (QT_DEBUG_PLUGINS) for debugging crashes")
-        sys_layout.addWidget(self.chk_diagnostic)
-        grp_system.setLayout(sys_layout)
-        layout.addWidget(grp_system)
+    def update_workbench_config(self):
+        """Update Workbench UI with latest settings (Models)"""
+        try:
+            # 1. Get Active Provider Models
+            provider = self.settings_manager.get_active_provider()
+            config = self.settings_manager.get_provider_config(provider)
+            models = config.get("models", [])
+            
+            # 2. Update Combo
+            self.workbench.model_combo.blockSignals(True)
+            self.workbench.model_combo.clear()
+            self.workbench.model_combo.addItems(models)
+            
+            # 3. Set Default
+            default_model = config.get("default_model")
+            if default_model:
+                self.workbench.model_combo.setCurrentText(default_model)
+            
+            self.workbench.model_combo.blockSignals(False)
+            
+            # 4. Update Status Indicator (Visual check)
+            api_key = self.settings_manager.get_api_key(provider)
+            if api_key:
+                self.workbench.status_indicator.set_status("green")
+                self.workbench.status_indicator.setToolTip(f"Connected to {provider}")
+            else:
+                self.workbench.status_indicator.set_status("yellow")
+                self.workbench.status_indicator.setToolTip("API Key Missing")
+                
+        except Exception as e:
+            logger.error(f"Failed to update workbench config: {e}")
 
-        layout.addStretch()
+    def on_settings_changed(self):
+        # Reload settings if needed (e.g. language defaults)
+        self.load_settings()
 
     def toggle_theme(self):
-        # Toggle between 'auto' (usually dark on this OS) and 'light'
-        current = self.settings.value("theme", "dark")
-        new_theme = "light" if current == "dark" else "dark"
+        """Toggle between dark and light theme"""
+        current_theme = self.settings.value("theme", "dark")
+        new_theme = "light" if current_theme == "dark" else "dark"
+        
         qdarktheme.setup_theme(new_theme)
+        self.apply_styles(new_theme)
+        
         self.settings.setValue("theme", new_theme)
-        self.apply_styles(new_theme) # Re-apply styles with new theme colors
+        logger.info(f"Theme changed to {new_theme}")
 
-    def apply_styles(self, theme="dark"):
-        # Custom tweaks based on theme
-        
-        if theme == "dark":
-            bg_sidebar = "#202124"
-            bg_filter = "#2D2F31"
-            border_col = "#3C4043"
-            text_col = "#E8EAED"
-            primary_col = "#007AFF"
-            title_col = "#60CDFF"
-            theme_icon = "🌙"
-            theme_tip = "Switch to Light Mode"
-        else:
-            bg_sidebar = "#F1F3F4" # Light gray
-            bg_filter = "#FFFFFF"
-            border_col = "#DADCE0"
-            text_col = "#202124"
-            primary_col = "#1A73E8"
-            title_col = "#1967D2"
-            theme_icon = "🌞"
-            theme_tip = "Switch to Dark Mode"
-
-        self.setStyleSheet(f"""
-            QLabel#appTitle {{ font-size: 24px; font-weight: bold; color: {title_col}; margin-bottom: 20px; }}
-            QPushButton {{ padding: 6px; border-radius: 4px; }}
-            QPushButton#btnPrimary {{ background-color: {primary_col}; color: white; font-weight: bold; padding: 10px; }}
-            QPushButton#btnPrimary:hover {{ opacity: 0.9; }}
-            QFrame#sidebar {{ background-color: {bg_sidebar}; border-right: 1px solid {border_col}; }}
-            QFrame#filterBar {{ background-color: {bg_filter}; border-bottom: 1px solid {border_col}; border-radius: 4px; }}
-            QTextEdit {{ font-family: Consolas, monospace; font-size: 13px; }}
-        """)
-        
-        # Update button text/icon
-        self.btn_theme.setText(theme_icon)
-        self.btn_theme.setToolTip(theme_tip)
-
-    # --- Settings persistence ---
     def load_settings(self):
         try:
+            # Language Defaults
             self.combo_src.setCurrentText(self.settings.value("source_lang", "zh-CN"))
             self.combo_tgt.setCurrentText(self.settings.value("target_lang", "en"))
-            self.combo_provider.setCurrentText(self.settings.value("provider", "SiliconFlow"))
-            self.txt_apikey.setText(self.settings.value("api_key", ""))
-            self.txt_model.setText(self.settings.value("model", ""))
-            self.txt_base_url.setText(self.settings.value("base_url", ""))
-            
-            # Auto-Repair config
-            self.chk_auto_repair.setChecked(self.settings.value("auto_repair_enabled", False, type=bool))
-            self.txt_repair_model.setText(self.settings.value("repair_model", "deepseek-chat"))
-            self.txt_repair_apikey.setText(self.settings.value("repair_api_key", ""))
-            self.txt_repair_base_url.setText(self.settings.value("repair_base_url", "https://api.deepseek.com"))
-            
-            # Diagnostic mode
-            self.chk_diagnostic.setChecked(self.settings.value("diagnostic_mode", False, type=bool))
             
             # Geometry
             geo = self.settings.value("geometry")
@@ -1013,59 +828,38 @@ class MainWindow(QMainWindow):
             # Theme
             theme = self.settings.value("theme", "dark")
             qdarktheme.setup_theme(theme)
-            self.apply_styles(theme) # Apply correct custom styles
-            
-            # Trigger provider update logic to set defaults if empty
-            self.on_provider_changed(self.combo_provider.currentText())
+            self.apply_styles(theme) 
             
         except Exception as e:
             print(f"Error loading settings: {e}")
-            
-    # Remove Provider Logic for Mock if necessary
-    def on_provider_changed(self, text):
-        presets = {
-            "SiliconFlow": ("https://api.siliconflow.cn/v1", "deepseek-ai/DeepSeek-V2.5"),
-            "OpenAI": ("https://api.openai.com/v1", "gpt-4o"),
-            "DeepSeek": ("https://api.deepseek.com", "deepseek-chat"),
-        }
-        
-        url, model = presets.get(text, ("", ""))
-        if url and not self.txt_base_url.text():
-            self.txt_base_url.setText(url)
-        if model and not self.txt_model.text():
-            self.txt_model.setText(model)
-            
+
+    def apply_styles(self, theme="dark"):
+        pass
+
     def get_client_config(self):
+        # Retrieve active config from SettingsManager
+        manager = self.settings_manager
+        provider = manager.get_active_provider()
+        config = manager.get_provider_config(provider)
+        key = manager.get_api_key(provider)
+        
         return {
-            "api_key": self.txt_apikey.text(),
-            "base_url": self.txt_base_url.text(),
-            "model": self.txt_model.text(),
+            "api_key": key,
+            "base_url": config.get("base_url"),
+            "model": config.get("default_model") or (config.get("models")[0] if config.get("models") else ""),
             "provider": "custom"
         }
 
     def get_client(self):
         config = self.get_client_config()
         if not config["api_key"]:
-            raise ValueError("API Key required")
+            raise ValueError("API Key required. Please configure in Settings.")
             
         return LLMClient(**config)
 
     def test_connection(self):
-        try:
-            client = self.get_client()
-        except Exception as e:
-            QMessageBox.warning(self, "Config Error", str(e))
-            return
-            
-        self.btn_test_conn.setEnabled(False)
-        self.btn_test_conn.setText("Testing...")
-        self.test_worker = TestConnectionWorker(client)
-        self.test_worker.finished.connect(lambda s, m: QTimer.singleShot(0, lambda: (
-            self.btn_test_conn.setEnabled(True),
-            self.btn_test_conn.setText("📡 Test Connection"),
-            QMessageBox.information(self, "Result", m) if s else QMessageBox.critical(self, "Error", m)
-        )))
-        self.test_worker.start()
+        # Moved to SettingsDialog
+        pass
 
     def open_file(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open XLIFF", "", "XLIFF (*.xlf *.xliff)")
@@ -1456,17 +1250,53 @@ class MainWindow(QMainWindow):
             profile=self.current_profile # Pass Profile
         )
         self.trans_worker.progress.connect(lambda c, t: self.progress.setValue(int(c/t*100)))
-        self.trans_worker.progress.connect(lambda c, t: self.perform_autosave())
+        self.trans_worker.batch_finished.connect(self.on_batch_translation_result)
         self.trans_worker.finished.connect(self.on_trans_finished)
         self.trans_worker.error.connect(lambda e: QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Error", e)))
         self.trans_worker.start()
 
+    def on_batch_translation_result(self, res_map: dict):
+        """Handle batch translation results safely in Main Thread"""
+        if not res_map: return
+        
+        # Using layoutAboutToBeChanged is safer for bulk updates
+        # self.model.layoutAboutToBeChanged.emit() # Optional if just data change
+        
+        # Optimize: Map ID to unit once
+        unit_map = {str(u.id): u for u in self.units}
+        
+        changed_indices = []
+        
+        for uid_str, text in res_map.items():
+            if uid_str in unit_map:
+                u = unit_map[uid_str]
+                if u.target_abstracted != text:
+                    u.target_abstracted = text
+                    u.state = "translated"
+                    changed_indices.append(u)
+
+        if changed_indices:
+            # Efficient refresh: Emit dataChanged for the whole range? 
+            # Or just layoutChanged for simplicity since it's a batch
+            self.model.layoutChanged.emit()
+            self.perform_autosave()
+
     def on_trans_finished(self):
-        self.btn_trans.setEnabled(True)
-        self.progress.setVisible(False)
-        self.model.layoutChanged.emit() # Force refresh
-        self.update_stats()
-        QTimer.singleShot(0, lambda: QMessageBox.information(self, "Done", "Translation complete!"))
+        try:
+            # Safety: Stop any pending hover actions to prevent conflict with layoutChanged
+            if hasattr(self, '_hover_timer'):
+                self._hover_timer.stop()
+                
+            self.btn_trans.setEnabled(True)
+            self.progress.setVisible(False)
+            self.model.layoutChanged.emit() # Force refresh
+            self.update_stats()
+            
+            # Delay the modal dialog to allow layout/rendering to stabilize (Prevent Access Violation)
+            # 300ms gives Qt event loop enough time to process the heavy layoutChanged event
+            QTimer.singleShot(300, lambda: QMessageBox.information(self, "Done", "Translation complete!"))
+        except Exception as e:
+            logger.error(f"Error in on_trans_finished: {e}")
 
     def generate_sample_draft(self):
         """Phase 6: Generate a small sample draft for user verification"""
@@ -1540,70 +1370,96 @@ class MainWindow(QMainWindow):
 
     def on_current_row_changed(self, current, previous):
         """Handle row selection change: Expand current, collapse previous."""
-        if previous.isValid():
-            self.table.setRowHeight(previous.row(), 40) # Restore default
-            
-        if current.isValid():
-            # Auto-expand
-            self.table.resizeRowToContents(current.row())
-            
-            # Update Refine Dock
-            proxy_idx = current
-            source_idx = self.proxy_model.mapToSource(proxy_idx)
-            self.update_ui_for_unit(source_idx.row())
-        else:
-            self.dock_refine.setVisible(False)
-            self.active_unit_index_map = -1
+        try:
+            if previous.isValid():
+                self.table.setRowHeight(previous.row(), 40) # Restore default
+                
+            if current.isValid():
+                # Auto-expand
+                # Safety Check: If selection has multiple rows, do NOT auto-expand the active one
+                # This prevents thrashing when dragging to select multiple rows
+                sel = self.table.selectionModel()
+                if sel and len(sel.selectedRows()) > 1:
+                    pass # Skip expansion during multi-select
+                else:
+                    self.table.resizeRowToContents(current.row())
+                
+                # Update Refine Dock
+                proxy_idx = current
+                source_idx = self.proxy_model.mapToSource(proxy_idx)
+                if source_idx.isValid():
+                    self.update_ui_for_unit(source_idx.row())
+            else:
+                self.active_unit_index_map = -1
+        except Exception as e:
+            # Swallow layout errors during rapid selection changes
+            logger.debug(f"Row change error: {e}")
 
     def on_table_hover(self, index):
         """
         Handle mouse hover: Expand hovered row temporarily.
         Uses a debounce timer to prevent jitter/flickering when moving rapidly across rows.
         """
-        # Initialize timer if needed
-        if not hasattr(self, '_hover_timer'):
-            self._hover_timer = QTimer(self)
-            self._hover_timer.setSingleShot(True)
-            self._hover_timer.timeout.connect(self._apply_hover_resize)
+        try:
+            # Initialize timer if needed
+            if not hasattr(self, '_hover_timer'):
+                self._hover_timer = QTimer(self)
+                self._hover_timer.setSingleShot(True)
+                self._hover_timer.timeout.connect(self._apply_hover_resize)
 
-        row = index.row()
-        current_row = self.table.currentIndex().row()
-        
-        # If we are already hovering this row (and it's processed), do nothing
-        if hasattr(self, '_last_hover_row') and self._last_hover_row == row:
-            return
+            row = index.row()
+            current_row = self.table.currentIndex().row()
+            
+            # If we are already hovering this row (and it's processed), do nothing
+            if hasattr(self, '_last_hover_row') and self._last_hover_row == row:
+                return
 
-        # Stop any pending resize for a different row
-        self._hover_timer.stop()
-        
-        # Store target and start debounce
-        self._hover_target_index = index
-        self._hover_timer.start(100) # 100ms delay for smoothness
+            # Stop any pending resize for a different row
+            self._hover_timer.stop()
+            
+            # Store target and start debounce
+            # Fix: Use QPersistentModelIndex to prevent Access Violation if model resets
+            self._hover_target_index = QPersistentModelIndex(index)
+            self._hover_timer.start(100) # 100ms delay for smoothness
+        except Exception:
+            pass
 
     def _apply_hover_resize(self):
         """Execute the actual row resizing after debounce delay"""
-        if not hasattr(self, '_hover_target_index') or not self._hover_target_index.isValid():
-            return
+        try:
+            if not hasattr(self, '_hover_target_index') or not self._hover_target_index.isValid():
+                return
+                
+            index = self._hover_target_index
+            row = index.row()
             
-        index = self._hover_target_index
-        row = index.row()
-        current_row = self.table.currentIndex().row()
-        
-        last_hover = getattr(self, '_last_hover_row', -1)
-        
-        # 1. Expand NEW row first (Stability: Ensure target exists before shifting others)
-        if row != current_row:
-            self.table.resizeRowToContents(row)
-            # Enforce minimum height to prevent "collapsing" empty rows
-            if self.table.rowHeight(row) < 40:
-                self.table.setRowHeight(row, 40)
-            self._last_hover_row = row
-        else:
-            self._last_hover_row = -1
+            # Double check row validity (index.row() might be valid but out of bounds if rows removed)
+            if row < 0 or row >= self.table.model().rowCount():
+                return
+
+            current_row = self.table.currentIndex().row()
             
-        # 2. Shrink OLD row (after new one is stable)
-        if last_hover != -1 and last_hover != current_row and last_hover != row:
-            self.table.setRowHeight(last_hover, 40)
+            # Skip hover expand if multi-select is active (prevent crash/lag)
+            if len(self.table.selectionModel().selectedRows()) > 1:
+                return
+
+            last_hover = getattr(self, '_last_hover_row', -1)
+            
+            # 1. Expand NEW row first (Stability: Ensure target exists before shifting others)
+            if row != current_row:
+                self.table.resizeRowToContents(row)
+                # Enforce minimum height to prevent "collapsing" empty rows
+                if self.table.rowHeight(row) < 40:
+                    self.table.setRowHeight(row, 40)
+                self._last_hover_row = row
+            else:
+                self._last_hover_row = -1
+                
+            # 2. Shrink OLD row (after new one is stable)
+            if last_hover != -1 and last_hover != current_row and last_hover != row:
+                self.table.setRowHeight(last_hover, 40)
+        except Exception:
+            pass
 
     def leaveEvent(self, event):
         """Restore hover row when leaving window/table area"""
@@ -1674,13 +1530,8 @@ class MainWindow(QMainWindow):
 
     def update_ui_for_unit(self, row):
         self.active_unit_index_map = row
-        unit = self.units[self.active_unit_index_map]
-        
-        self.dock_refine.setVisible(True)
-        self.txt_source.setText(unit.source_abstracted)
-        self.txt_target_edit.setPlainText(unit.target_abstracted or "")
-        self.txt_diff.clear()
-        self.txt_prompt.clear()
+        # Note: Workbench updates are now demand-driven via "Add Context" button
+        # or we could auto-push here if desired. For now, we just track the active row.
 
     def grid_navigate(self, delta):
         # Implementation for Ctrl+Up/Down
@@ -1695,77 +1546,11 @@ class MainWindow(QMainWindow):
                 self.table.setCurrentIndex(new_idx)
                 self.table.selectRow(new_row)
 
-    def refine_current_segment(self):
-        if self.active_unit_index_map < 0: return
-        
-        unit = self.units[self.active_unit_index_map]
-        instruction = self.txt_prompt.text()
-        if not instruction: return
-            
-        try:
-            client = self.get_client()
-        except: return
-            
-        self.btn_refine.setEnabled(False)
-        self.btn_refine.setText("Refining...")
-        
-        # We refine based on abstract source and CURRENT EDIT state in box
-        current_val = self.txt_target_edit.toPlainText()
-        
-        self.refine_worker = RefineWorker(client, unit.source_abstracted, current_val, instruction)
-        self.refine_worker.finished.connect(self.on_refine_finished)
-        self.refine_worker.start()
-
-    def on_refine_finished(self, new_text):
-        old_text = self.txt_target_edit.toPlainText()
-        
-        # Show diff
-        # d = difflib.HtmlDiff(wrapcolumn=40)
-        
-        # Update Edit box
-        self.txt_target_edit.setPlainText(new_text)
-        
-        # Render simple Diff string (Red/Green)
-        diff_html = self.generate_diff_html(old_text, new_text)
-        self.txt_diff.setHtml(diff_html)
-        
-        self.btn_refine.setEnabled(True)
-        self.btn_refine.setText("✨ Refine")
-        self.txt_prompt.clear()
-
-    def generate_diff_html(self, old, new):
-        # Simple word-based diff
-        seq = difflib.SequenceMatcher(None, old, new)
-        html = []
-        for tag, i1, i2, j1, j2 in seq.get_opcodes():
-            if tag == 'replace':
-                html.append(f"<span style='background-color:#ffcccc; text-decoration:line-through'>{old[i1:i2]}</span>")
-                html.append(f"<span style='background-color:#ccffcc'>{new[j1:j2]}</span>")
-            elif tag == 'delete':
-                html.append(f"<span style='background-color:#ffcccc; text-decoration:line-through'>{old[i1:i2]}</span>")
-            elif tag == 'insert':
-                html.append(f"<span style='background-color:#ccffcc'>{new[j1:j2]}</span>")
-            elif tag == 'equal':
-                html.append(old[i1:i2])
-        return "".join(html).replace("\n", "<br>")
-
-    def apply_refinement(self):
-        # Save text from edit box to model
-        if self.active_unit_index_map < 0: return
-        
-        new_text = self.txt_target_edit.toPlainText()
-        unit = self.units[self.active_unit_index_map]
-        
-        if unit.target_abstracted != new_text:
-            unit.target_abstracted = new_text
-            unit.state = "edited"
-            self.model.refresh_row(self.active_unit_index_map)
-            self.update_stats()
-            
-        # Move next
-        self.navigate_grid(1)
-
     def show_context_menu(self, pos):
+        # Stop hover timer to prevent conflicts with menu actions/model updates
+        if hasattr(self, '_hover_timer'):
+            self._hover_timer.stop()
+
         # Get selected proxied indexes
         proxy_indexes = self.table.selectionModel().selectedRows()
         if not proxy_indexes: return
@@ -1819,12 +1604,20 @@ class MainWindow(QMainWindow):
 
         elif action == action_clear:
             try:
+                # Safety: Stop hover timer (Fix Access Violation during layout change)
+                if hasattr(self, '_hover_timer'):
+                    self._hover_timer.stop()
+
                 # 1. Show Wait Cursor
                 QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
                 
                 # 2. Batch Update
                 # Temporarily block signals if needed, but layoutChanged is enough
                 changed_count = 0
+                
+                # Notify model about structure change to be safe
+                self.model.layoutAboutToBeChanged.emit()
+                
                 for u in selected_units:
                     if u.state == "locked": continue
                     # Only change if not empty
@@ -1841,6 +1634,10 @@ class MainWindow(QMainWindow):
                     # 4. Autosave (CRITICAL)
                     self.perform_autosave()
                     logger.info(f"Cleared {changed_count} segments.")
+                else:
+                    # If no changes, still need to close layout transaction if we opened one? 
+                    # layoutChanged usually pairs with layoutAboutToBeChanged
+                    self.model.layoutChanged.emit()
                 
             except Exception as e:
                 logger.error(f"Error clearing targets: {e}")
@@ -1946,10 +1743,22 @@ class MainWindow(QMainWindow):
         
         self.repair_worker = RepairWorker(error_units, repair_client)
         self.repair_worker.progress.connect(lambda c, t: self.progress.setValue(int(c/t*100)))
+        self.repair_worker.segment_repaired.connect(self.on_segment_repaired)
         self.repair_worker.finished.connect(self.on_repair_finished)
         self.repair_worker.error.connect(lambda e: QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Repair Error", e)))
         self.repair_worker.start()
     
+    def on_segment_repaired(self, unit_id: int, new_target: str, new_state: str):
+        """Handle individual segment repair result in Main Thread"""
+        # Find unit by ID
+        for u in self.units:
+            if u.id == unit_id:
+                u.target_abstracted = new_target
+                u.state = new_state
+                # We don't need to refresh UI for every single segment (too slow),
+                # we wait for final layoutChanged or batch updates.
+                break
+
     def on_repair_finished(self, repaired_count, failed_count):
         """Called when batch repair completes"""
         self.btn_batch_repair.setEnabled(True)
@@ -2160,15 +1969,23 @@ class MainWindow(QMainWindow):
         # Save settings on exit
         self.settings.setValue("source_lang", self.combo_src.currentText())
         self.settings.setValue("target_lang", self.combo_tgt.currentText())
-        self.settings.setValue("provider", self.combo_provider.currentText())
-        self.settings.setValue("api_key", self.txt_apikey.text())
-        self.settings.setValue("model", self.txt_model.text())
-        self.settings.setValue("base_url", self.txt_base_url.text())
-        self.settings.setValue("auto_repair_enabled", self.chk_auto_repair.isChecked())
-        self.settings.setValue("repair_model", self.txt_repair_model.text())
-        self.settings.setValue("repair_api_key", self.txt_repair_apikey.text())
-        self.settings.setValue("repair_base_url", self.txt_repair_base_url.text())
-        self.settings.setValue("diagnostic_mode", self.chk_diagnostic.isChecked())
+        # Provider settings are now managed by SettingsDialog/SettingsManager, 
+        # so we don't need to manually save combo_provider etc. here.
+        # self.settings.setValue("provider", self.combo_provider.currentText())
+        # self.settings.setValue("api_key", self.txt_apikey.text())
+        # self.settings.setValue("model", self.txt_model.text())
+        # self.settings.setValue("base_url", self.txt_base_url.text())
+        
+        # Save Auto-Repair status if checkbox exists in main UI?
+        # Actually it seems auto-repair checkbox was moved too or accessed differently.
+        # Let's check if chk_auto_repair exists in MainWindow
+        if hasattr(self, 'chk_auto_repair'):
+            self.settings.setValue("auto_repair_enabled", self.chk_auto_repair.isChecked())
+        
+        # Save Diagnostic Mode
+        if hasattr(self, 'chk_diagnostic'):
+            self.settings.setValue("diagnostic_mode", self.chk_diagnostic.isChecked())
+            
         self.settings.setValue("geometry", self.saveGeometry())
         
         # Mark clean shutdown
@@ -2195,6 +2012,273 @@ class MainWindow(QMainWindow):
                  if proxy_idx.isValid():
                      self.table.selectRow(proxy_idx.row())
                      self.table.scrollTo(proxy_idx)
+
+    # --- Workbench Integration ---
+
+    def connect_workbench_signals(self):
+        # Connect Workbench Actions
+        self.workbench.settings_btn.clicked.connect(self.open_settings_dialog)
+        self.workbench.request_context.connect(self.on_workbench_request_context)
+        self.workbench.send_btn.clicked.connect(self.on_workbench_send)
+        self.workbench.request_apply.connect(self.on_workbench_apply)
+
+    def on_workbench_request_context(self):
+        """Called when user clicks 'Add Context' in Workbench"""
+        # 1. Check Selection (Support Multi-Select)
+        # Use selectedRows(0) to ensure we get unique rows regardless of column selection
+        proxy_indexes = self.table.selectionModel().selectedRows(0)
+        
+        if not proxy_indexes:
+            QMessageBox.warning(self, "No Selection", "Please select segments in the table first.")
+            return
+
+        # 2. Map to Units & Sort visually
+        proxy_indexes = sorted(proxy_indexes, key=lambda x: x.row())
+        selected_units = []
+        for p_idx in proxy_indexes:
+            if not p_idx.isValid(): continue
+            src_idx = self.proxy_model.mapToSource(p_idx)
+            if not src_idx.isValid(): continue
+            
+            row = src_idx.row()
+            if 0 <= row < len(self.units):
+                selected_units.append(self.units[row])
+
+        if not selected_units: return
+
+        # 3. Single vs Multi Logic
+        if len(selected_units) == 1:
+            unit = selected_units[0]
+            tokens = TokenGuard.extract_tokens(unit.source_abstracted)
+            
+            self.workbench.set_context(
+                source=unit.source_abstracted,
+                target=unit.target_abstracted or "",
+                tokens=tokens
+            )
+            self.workbench.pending_unit_id = unit.id
+            self.workbench.pending_unit_ids = None # Clear multi-list
+            
+        else:
+            # Multi-segment mode
+            combined_source = ""
+            combined_target = ""
+            ids = []
+            
+            for u in selected_units:
+                combined_source += f"[ID:{u.id}] {u.source_abstracted}\n"
+                combined_target += f"[ID:{u.id}] {u.target_abstracted or ''}\n"
+                ids.append(u.id)
+            
+            self.workbench.set_context(
+                source=combined_source.strip(),
+                target=combined_target.strip(),
+                tokens=[] # No token guard for batch yet
+            )
+            self.workbench.pending_unit_id = None
+            self.workbench.pending_unit_ids = ids
+            
+            self.workbench.chat_display.append(f"<br><i>Batch Mode: {len(ids)} segments selected.</i>")
+
+    def on_workbench_send(self):
+        """Called when user clicks 'Send' in Workbench"""
+        payload = self.workbench.get_prompt_payload()
+        if not payload["source"]:
+            QMessageBox.warning(self, "No Context", "Please add context first.")
+            return
+
+        # Inject Target Language Info
+        target_lang = self.combo_tgt.currentText()
+        payload["target_lang"] = target_lang
+
+        # Inject Batch Instruction if needed
+        if getattr(self.workbench, 'pending_unit_ids', None):
+             # Prepend formatting requirement
+             batch_instr = (
+                 f"You are translating multiple segments into {target_lang}. "
+                 "The input format is '[ID:x] Source Text'. "
+                 "Please provide the translation in the exact same format: '[ID:x] Translated Text'. "
+                 "Do not miss any segments. Keep IDs matching.\n\n"
+             )
+             payload["instruction"] = batch_instr + payload["instruction"]
+
+        try:
+            client = self.get_client()
+        except Exception as e:
+            QMessageBox.warning(self, "Config Error", str(e))
+            return
+
+        self.workbench.set_loading(True)
+        
+        self.wb_worker = WorkbenchWorker(client, payload)
+        self.wb_worker.finished.connect(self.on_workbench_response)
+        self.wb_worker.error.connect(lambda e: (
+            self.workbench.set_loading(False),
+            self.workbench.append_ai_response(f"<span style='color:red'>Error: {e}</span>")
+        ))
+        self.wb_worker.start()
+
+    def on_workbench_response(self, response_text):
+        self.workbench.set_loading(False)
+        self.workbench.append_ai_response(response_text)
+        
+        # Update Diff View
+        current_target = self.workbench.pending_target
+        self.workbench.update_diff(current_target, response_text)
+        self.workbench.pending_new_text = response_text
+        
+        # Check Mode
+        if getattr(self.workbench, 'pending_unit_ids', None):
+            # Batch Mode Validation
+            self.workbench.apply_btn.setEnabled(True)
+            self.workbench.apply_btn.setText("✅ Apply Batch")
+            self.workbench.apply_btn.setToolTip("Apply translation to multiple segments")
+            
+        else:
+            # Single Mode Token Validation
+            # Fallback to pending_unit_id if active_unit_index_map is not reliable (user moved selection)
+            unit = None
+            if hasattr(self.workbench, 'pending_unit_id') and self.workbench.pending_unit_id:
+                for u in self.units:
+                    if u.id == self.workbench.pending_unit_id:
+                        unit = u
+                        break
+            
+            if unit:
+                result = TokenGuard.validate(unit.source_abstracted, response_text, unit.tags_map)
+                
+                if result.valid:
+                    self.workbench.apply_btn.setEnabled(True)
+                    self.workbench.apply_btn.setText("✅ Apply to Editor")
+                    self.workbench.apply_btn.setToolTip("Tokens Validated")
+                else:
+                    self.workbench.apply_btn.setEnabled(False)
+                    self.workbench.apply_btn.setText("⛔ Blocked: Token Error")
+                    self.workbench.apply_btn.setToolTip(result.message)
+                    self.workbench.append_ai_response(f"<br><b>Token Guard:</b> <span style='color:red'>{result.message}</span>")
+
+    def on_workbench_apply(self, new_text):
+        """Called when user clicks 'Apply' in Workbench"""
+        
+        # Batch Apply
+        ids = getattr(self.workbench, 'pending_unit_ids', None)
+        if ids:
+            # Parse [ID:x] format
+            # Relaxed Regex: Allow spaces, case-insensitive ID, flexible separators
+            # Matches: [ID:1], [id: 1], [ID : 1]
+            pattern = re.compile(r'\[(?:ID|id)\s*:\s*(\d+)\]\s*(.*?)(?=\s*\[(?:ID|id)\s*:\s*\d+\]|\Z)', re.DOTALL | re.IGNORECASE)
+            matches = pattern.findall(new_text)
+            
+            result_map = {int(m[0]): m[1].strip() for m in matches}
+            
+            # Validation: Check for missing segments
+            missing_ids = [uid for uid in ids if uid not in result_map]
+            
+            # Special Handling: If regex failed completely but we have IDs, 
+            # try a naive line-by-line fallback if lines count matches
+            if len(result_map) == 0 and len(ids) > 0:
+                 # Strategy A: Line-by-Line (for clean multiline output)
+                 lines = [line.strip() for line in new_text.strip().split('\n') if line.strip()]
+                 if len(lines) > len(ids) and lines[0].lower().startswith("ai:"):
+                     lines = lines[1:]
+                     
+                 if len(lines) == len(ids):
+                     # Fallback: Map strictly by order
+                     for i, uid in enumerate(ids):
+                         content = lines[i]
+                         content = re.sub(r'^\[(?:ID|id)\s*:\s*\d+\]\s*', '', content, flags=re.IGNORECASE)
+                         result_map[uid] = content
+                     missing_ids = []
+                 
+                 # Strategy B: Delimiter Split (for single-line/wrapped output)
+                 # If Strategy A failed, try splitting by the ID tag itself
+                 else:
+                     # Split by [ID:x] pattern
+                     chunks = re.split(r'\[(?:ID|id)\s*:\s*\d+\]', new_text, flags=re.IGNORECASE)
+                     # Filter empty start chunk
+                     chunks = [c.strip() for c in chunks if c.strip()]
+                     
+                     if len(chunks) == len(ids):
+                         for i, uid in enumerate(ids):
+                             result_map[uid] = chunks[i]
+                         missing_ids = [] # Clear missing since we recovered
+            
+            # Validation: Check for missing segments
+            missing_ids = [uid for uid in ids if uid not in result_map]
+            
+            # Smart Remap: If counts match but IDs don't (AI hallucinated new IDs 1,2,3 instead of 48,49...),
+            # force map by order.
+            if missing_ids and len(result_map) == len(ids):
+                logger.info("AI hallucinated IDs. Remapping by sequence order.")
+                
+                # Sort both by their respective order
+                sorted_ai_ids = sorted(result_map.keys())
+                # ids is already sorted by selection order in on_workbench_request_context? 
+                # Actually ids comes from pending_unit_ids which was appended in loop order.
+                
+                new_map = {}
+                for i, real_id in enumerate(ids):
+                    hallucinated_id = sorted_ai_ids[i]
+                    new_map[real_id] = result_map[hallucinated_id]
+                
+                result_map = new_map
+                missing_ids = [] # Fixed!
+
+            if missing_ids:
+                msg = f"AI output incomplete. Selected {len(ids)} segments, but found {len(result_map)} in response.\n\nMissing IDs: {missing_ids}\n\nApply anyway?"
+                reply = QMessageBox.question(self, "Incomplete Response", msg, QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                if reply == QMessageBox.StandardButton.No:
+                    return
+
+            changes = 0
+            for uid in ids:
+                if uid in result_map:
+                    for unit in self.units:
+                        if unit.id == uid:
+                            if unit.target_abstracted != result_map[uid]:
+                                unit.target_abstracted = result_map[uid]
+                                unit.state = "edited"
+                                changes += 1
+                            break
+            
+            if changes > 0:
+                self.model.layoutAboutToBeChanged.emit()
+                self.model.layoutChanged.emit()
+                self.update_stats()
+                self.perform_autosave()
+                QMessageBox.information(self, "Applied", f"Updated {changes} segments.")
+                
+                self.workbench.diff_view.clear()
+                self.workbench.apply_btn.setEnabled(False)
+                self.workbench.pending_unit_ids = None # Reset
+            else:
+                QMessageBox.warning(self, "No Changes", "No segments were updated. Check if AI maintained [ID:x] format.")
+            
+            return
+
+        # Single Apply
+        if self.active_unit_index_map < 0: return
+        
+        unit = self.units[self.active_unit_index_map]
+        
+        # Double check ID match (paranoid check)
+        if hasattr(self.workbench, 'pending_unit_id') and self.workbench.pending_unit_id != unit.id:
+            QMessageBox.warning(self, "Mismatch", "Selection changed! Please re-add context.")
+            return
+
+        if unit.target_abstracted != new_text:
+            unit.target_abstracted = new_text
+            unit.state = "edited"
+            self.model.refresh_row(self.active_unit_index_map)
+            self.update_stats()
+            self.perform_autosave()
+            
+            # Update local workbench state to match new reality
+            self.workbench.pending_target = new_text
+            self.workbench.diff_view.clear()
+            self.workbench.apply_btn.setEnabled(False) # Disable after apply
+            
+            QMessageBox.information(self, "Applied", "Translation updated successfully.")
 
 if __name__ == "__main__":
     import faulthandler

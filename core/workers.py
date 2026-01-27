@@ -8,6 +8,7 @@ import json
 
 class TranslationWorker(QThread):
     progress = pyqtSignal(int, int)  # current, total
+    batch_finished = pyqtSignal(dict) # NEW: Emit {id_str: translation}
     finished = pyqtSignal()
     error = pyqtSignal(str)
 
@@ -39,19 +40,6 @@ class TranslationWorker(QThread):
                 
                 # Use PromptBuilder to format user message
                 segments = [{"id": u.id, "source": u.source_abstracted} for u in batch]
-                # Note: We pass pre-built prompts to client if client supports it, 
-                # OR we modify client to accept 'system_instruction'.
-                # Assuming client.translate_batch can take system_prompt override or we just pass segments
-                # and let client handle it?
-                # Actually, client.translate_batch usually takes raw segments. 
-                # Let's check client.py. If client.py uses hardcoded prompt, we need to change that too.
-                # For now, let's assume we pass the system_instruction to translate_batch if it supports it.
-                # If not, we might need to modify client.py.
-                
-                # Let's look at client.py first.
-                # Since I cannot see client.py in this turn, I will assume I need to pass it.
-                # But wait, I am the one writing the code.
-                # I will modify client.translate_batch to accept system_prompt.
                 
                 results = self.client.translate_batch(
                     segments, 
@@ -62,10 +50,13 @@ class TranslationWorker(QThread):
                 
                 # Map results back to units
                 res_map = {str(res["id"]): res["translation"] for res in results}
-                for u in batch:
-                    if u.id in res_map:
-                        u.target_abstracted = res_map[u.id]
-                        u.state = "translated"
+                
+                # Debug logging
+                if not res_map and results:
+                    print(f"[Worker] Warning: res_map empty but results exist. Keys: {[r.get('id') for r in results]}")
+
+                # Emit results to main thread instead of modifying directly
+                self.batch_finished.emit(res_map)
                 
                 self.progress.emit(min(i + batch_size, total), total)
             
@@ -223,3 +214,55 @@ class TestConnectionWorker(QThread):
     def run(self):
         success, message = self.client.test_connection()
         self.finished.emit(success, message)
+
+class WorkbenchWorker(QThread):
+    finished = pyqtSignal(str) # AI response text
+    error = pyqtSignal(str)
+
+    def __init__(self, client, payload: dict):
+        super().__init__()
+        self.client = client
+        self.payload = payload
+
+    def run(self):
+        try:
+            # Construct Prompt
+            # Payload: source, target, tokens, instruction
+            source = self.payload.get("source", "")
+            target = self.payload.get("target", "")
+            tokens = self.payload.get("tokens", [])
+            instruction = self.payload.get("instruction", "")
+            
+            token_str = ", ".join(tokens) if tokens else "None"
+            
+            system_prompt = (
+                "You are a professional translator and editor. "
+                "Your task is to refine the translation based on user instructions.\n"
+                "CRITICAL: You must preserve all XLIFF tokens exactly as they appear in the source.\n"
+                f"Required Tokens: {token_str}\n"
+                "Output ONLY the refined translation text."
+            )
+            
+            user_prompt = (
+                f"Source: {source}\n"
+                f"Current Translation: {target}\n"
+                f"User Instruction: {instruction}\n\n"
+                "Refined Translation:"
+            )
+            
+            # Use raw client chat completion
+            # Assuming client.client is the OpenAI/Compatible client
+            response = self.client.client.chat.completions.create(
+                model=self.client.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.3
+            )
+            
+            content = response.choices[0].message.content.strip()
+            self.finished.emit(content)
+            
+        except Exception as e:
+            self.error.emit(str(e))

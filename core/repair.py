@@ -3,6 +3,7 @@ import re
 
 class RepairWorker(QThread):
     progress = pyqtSignal(int, int)  # current, total
+    segment_repaired = pyqtSignal(int, str, str) # NEW: Emit (id, target, state)
     finished = pyqtSignal(int, int)  # repaired_count, failed_count
     error = pyqtSignal(str)
     
@@ -38,10 +39,10 @@ class RepairWorker(QThread):
                     required_tokens=required_tokens
                 )
                 
-                # Update unit
+                # Check change
                 if fixed_target != unit.target_abstracted:
-                    unit.target_abstracted = fixed_target
-                    unit.state = "edited"
+                    # Emit result instead of modifying directly
+                    self.segment_repaired.emit(unit.id, fixed_target, "edited")
                     repaired_count += 1
                 else:
                     failed_count += 1
