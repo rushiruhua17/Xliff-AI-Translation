@@ -732,6 +732,12 @@ class MainWindow(QMainWindow):
         qa_bar.addWidget(QLabel("(Showing only errors & warnings)"))
         qa_bar.addStretch()
         
+        # Batch Auto-Repair Button
+        self.btn_qa_repair = QPushButton("🔧 Batch Auto-Repair")
+        self.btn_qa_repair.setToolTip("Automatically fix all critical errors using configured Repair Model")
+        self.btn_qa_repair.clicked.connect(self.batch_auto_repair)
+        qa_bar.addWidget(self.btn_qa_repair)
+        
         # Button to re-apply filter manualy if needed (usually auto)
         btn_refresh = QPushButton("🔄 Refresh Filter")
         btn_refresh.clicked.connect(lambda: self.proxy_qa.invalidate())
@@ -1336,7 +1342,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Info", "No translatable segments found for sampling or empty result.")
             return
             
-        # Format results for display
+        # Format results for display (results is now list of dicts)
         text_preview = ""
         for res in results:
             text_preview += f"[ID {res['id']}] {res['translation']}\n\n"
@@ -1687,20 +1693,34 @@ class MainWindow(QMainWindow):
         else:
             QTimer.singleShot(100, lambda: QMessageBox.information(self, "QA Passed", msg))
 
+    def get_client_for_task(self, task_name: str):
+        """Generic method to get LLM client for a specific task"""
+        # 1. Resolve Profile
+        profile_config = self.config.get_profile_by_task(task_name)
+        if not profile_config:
+            # Fallback for Translation: Use legacy settings (temporarily) or first available?
+            # Better to raise config error to prompt user setup
+            raise ValueError(f"No model assigned for '{task_name}'. Please configure in Settings > Task Assignment.")
+            
+        # 2. Extract Credentials
+        return LLMClient(
+            api_key=profile_config.get("api_key", ""),
+            base_url=profile_config.get("base_url", ""),
+            model=profile_config.get("model", ""),
+            provider=profile_config.get("provider", "custom")
+        )
+
+    def get_client(self):
+        """Legacy wrapper for Translation Client"""
+        return self.get_client_for_task("translation")
+
     def get_repair_client(self):
         """Create a secondary LLM client for repair tasks (uses Repair Model config)"""
-        if not self.chk_auto_repair.isChecked():
+        # Check toggle
+        if not self.config.auto_repair_enabled:
             raise ValueError("Auto-Repair is not enabled in Settings")
-        
-        # Use repair config if provided, otherwise fallback to main config
-        repair_key = self.txt_repair_apikey.text() or self.txt_apikey.text()
-        repair_model = self.txt_repair_model.text() or "deepseek-chat"
-        repair_url = self.txt_repair_base_url.text() or "https://api.deepseek.com"
-        
-        if not repair_key:
-            raise ValueError("Repair API Key required (or main API Key)")
-        
-        return LLMClient(api_key=repair_key, base_url=repair_url, model=repair_model, provider="custom")
+            
+        return self.get_client_for_task("repair")
     
     def batch_auto_repair(self):
         """Batch repair all units with qa_status == 'error'"""
@@ -1709,21 +1729,24 @@ class MainWindow(QMainWindow):
             return
         
         # Check if Auto-Repair is enabled
-        if not self.chk_auto_repair.isChecked():
+        if not self.config.auto_repair_enabled:
             QMessageBox.information(self, "Auto-Repair Disabled", 
-                "Auto-Repair is currently disabled.\n\nPlease enable it in Settings Tab and configure a Repair Model.")
+                "Auto-Repair is currently disabled.\n\nPlease enable it in Settings > Auto-Repair Tab.")
             return
+            
+        # 1. Run QA First (Ensure status is up-to-date)
+        self.run_qa(silent=True)
         
         # Filter error units
         error_units = [u for u in self.units if u.qa_status == "error"]
         
         if not error_units:
-            QMessageBox.information(self, "No Errors", "No error segments found. Run QA first!")
+            QMessageBox.information(self, "No Errors", "No critical errors found to repair.")
             return
         
         # Confirm action
         reply = QMessageBox.question(self, "Batch Auto-Repair", 
-            f"Found {len(error_units)} segments with errors.\n\nAttempt to auto-repair all using AI?\n\n(This will use your Repair Model API)",
+            f"Found {len(error_units)} segments with critical errors.\n\nAttempt to auto-repair all using AI?\n\n(This will use your Repair Model API)",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         
         if reply != QMessageBox.StandardButton.Yes:
@@ -1733,11 +1756,15 @@ class MainWindow(QMainWindow):
             repair_client = self.get_repair_client()
         except Exception as e:
             QMessageBox.critical(self, "Config Error", str(e))
+            # Open Settings to fix
+            self.open_settings()
             return
         
         # Start repair worker
-        self.btn_batch_repair.setEnabled(False)
-        self.btn_batch_repair.setText("Repairing...")
+        if hasattr(self, 'btn_qa_repair'):
+            self.btn_qa_repair.setEnabled(False)
+            self.btn_qa_repair.setText("Repairing...")
+            
         self.progress.setVisible(True)
         self.progress.setValue(0)
         
@@ -1747,7 +1774,7 @@ class MainWindow(QMainWindow):
         self.repair_worker.finished.connect(self.on_repair_finished)
         self.repair_worker.error.connect(lambda e: QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Repair Error", e)))
         self.repair_worker.start()
-    
+
     def on_segment_repaired(self, unit_id: int, new_target: str, new_state: str):
         """Handle individual segment repair result in Main Thread"""
         # Find unit by ID
@@ -1755,14 +1782,14 @@ class MainWindow(QMainWindow):
             if u.id == unit_id:
                 u.target_abstracted = new_target
                 u.state = new_state
-                # We don't need to refresh UI for every single segment (too slow),
-                # we wait for final layoutChanged or batch updates.
                 break
 
     def on_repair_finished(self, repaired_count, failed_count):
         """Called when batch repair completes"""
-        self.btn_batch_repair.setEnabled(True)
-        self.btn_batch_repair.setText("🔧 Batch Auto-Repair")
+        if hasattr(self, 'btn_qa_repair'):
+            self.btn_qa_repair.setEnabled(True)
+            self.btn_qa_repair.setText("🔧 Batch Auto-Repair")
+            
         self.progress.setVisible(False)
         
         # Refresh UI

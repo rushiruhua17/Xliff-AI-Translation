@@ -132,7 +132,7 @@ class ProfileGeneratorWorker(QThread):
             self.error.emit(str(e))
 
 class SampleWorker(QThread):
-    finished = pyqtSignal(list) # Returns list of sample translations
+    finished = pyqtSignal(list) # Returns list of dicts: [{'id': 1, 'source': '...', 'translation': '...'}]
     error = pyqtSignal(str)
 
     def __init__(self, units: List[TranslationUnit], client_config: dict, source_lang: str, target_lang: str, profile=None, sample_size=5):
@@ -150,7 +150,12 @@ class SampleWorker(QThread):
         import random
         random_m = random.sample(remaining, min(m, len(remaining))) if remaining else []
         
-        self.sample_units = first_n + random_m
+        # Store as dicts, not objects, to avoid thread safety issues
+        self.sample_segments = [
+            {"id": u.id, "source": u.source_abstracted} 
+            for u in (first_n + random_m)
+        ]
+        
         self.client_config = client_config
         self.source_lang = source_lang
         self.target_lang = target_lang
@@ -158,7 +163,7 @@ class SampleWorker(QThread):
 
     def run(self):
         try:
-            if not self.sample_units:
+            if not self.sample_segments:
                 self.finished.emit([])
                 return
 
@@ -172,16 +177,30 @@ class SampleWorker(QThread):
             # Add explicit instruction that this is a SAMPLE draft
             system_instruction += "\n\nNOTE: This is a sample draft. Provide diverse options if context is ambiguous."
 
-            segments = [{"id": u.id, "source": u.source_abstracted} for u in self.sample_units]
-            
             results = client.translate_batch(
-                segments, 
+                self.sample_segments, 
                 self.source_lang, 
                 self.target_lang,
                 system_prompt=system_instruction
             )
             
-            self.finished.emit(results)
+            # Results are already dicts: [{'id': ..., 'translation': ...}]
+            # We might want to include source text for display
+            final_output = []
+            
+            # Map results to source for completeness
+            res_map = {str(r['id']): r['translation'] for r in results}
+            
+            for seg in self.sample_segments:
+                seg_id = str(seg['id'])
+                if seg_id in res_map:
+                    final_output.append({
+                        "id": seg['id'],
+                        "source": seg['source'],
+                        "translation": res_map[seg_id]
+                    })
+            
+            self.finished.emit(final_output)
             
         except Exception as e:
             self.error.emit(str(e))
