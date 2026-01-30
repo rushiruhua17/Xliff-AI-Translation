@@ -30,6 +30,25 @@ class XliffParser:
             if None in self.root.nsmap:
                 self.ns['xliff'] = self.root.nsmap[None]
 
+    def get_languages(self) -> tuple[str, str]:
+        """
+        Extracts source and target languages from the first <file> element.
+        Returns: (source_lang, target_lang) e.g., ("en-US", "zh-CN")
+        """
+        if self.root is None:
+            return ("", "")
+            
+        # Find first file element
+        files = self.root.xpath('//*[local-name()="file"]')
+        if not files:
+            return ("", "")
+            
+        file_node = files[0]
+        src = file_node.get("source-language", "")
+        tgt = file_node.get("target-language", "")
+        
+        return src, tgt
+
     def get_translation_units(self) -> List[TranslationUnit]:
         """Extracts translation units from the parsed tree."""
         units = []

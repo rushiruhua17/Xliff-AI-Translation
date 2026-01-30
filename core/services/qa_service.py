@@ -10,6 +10,15 @@ class QAService:
     def __init__(self):
         self.checker = QAChecker()
 
+    @staticmethod
+    def check_batch(units: List[TranslationUnit]) -> Tuple[int, int]:
+        """
+        Static method to run QA check on a batch of units.
+        Convenience wrapper around run_qa.
+        """
+        service = QAService()
+        return service.run_qa(units)
+
     def run_qa(self, units: List[TranslationUnit]) -> Tuple[int, int]:
         """
         Runs QA check on all units.
