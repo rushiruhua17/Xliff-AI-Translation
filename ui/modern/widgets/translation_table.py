@@ -1,6 +1,7 @@
 from PyQt6.QtWidgets import (QTableView, QHeaderView, QMenu, QMessageBox, QApplication)
 from PyQt6.QtCore import Qt, pyqtSignal, QPoint
 from PyQt6.QtGui import QAction, QCursor
+from qfluentwidgets import RoundMenu, Action
 
 # Reuse existing core logic
 from core.xliff_model import XliffTableModel, XliffFilterProxyModel
@@ -68,6 +69,72 @@ class ModernTranslationTable(QTableView):
         self.setColumnWidth(2, 40)
         self.setColumnWidth(3, 40)
         self.setColumnWidth(4, 150)
+        
+        # Enable Header Context Menu
+        h.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        h.customContextMenuRequested.connect(self.show_header_menu)
+        
+        # Load persisted column state
+        self.load_column_state()
+
+    def show_header_menu(self, pos):
+        header = self.horizontalHeader()
+        # Use RoundMenu for Fluent Design
+        menu = RoundMenu(parent=self)
+        
+        # Headers: ID, State, Tags, QA, Details, Source, Target
+        headers = ["ID", "State", "Tags", "QA", "Details", "Source", "Target"]
+        
+        for i, text in enumerate(headers):
+            # Create action
+            action = Action(text, parent=self)
+            action.setCheckable(True)
+            action.setChecked(not header.isSectionHidden(i))
+            
+            # Use closure to capture index
+            action.triggered.connect(lambda checked, idx=i: self.toggle_column(idx, checked))
+            menu.addAction(action)
+            
+        menu.exec(header.mapToGlobal(pos))
+
+    def toggle_column(self, index, visible):
+        self.setColumnHidden(index, not visible)
+        self.save_column_state()
+
+    def save_column_state(self):
+        from PyQt6.QtCore import QSettings
+        settings = QSettings("MyCompany", "XLIFF_AI_Assistant")
+        
+        # Save visibility
+        hidden_cols = []
+        for i in range(7):
+            if self.isColumnHidden(i):
+                hidden_cols.append(i)
+        
+        settings.setValue("table_hidden_cols", hidden_cols)
+        
+        # Save widths (optional, but good UX)
+        settings.setValue("table_state", self.horizontalHeader().saveState())
+
+    def load_column_state(self):
+        from PyQt6.QtCore import QSettings
+        settings = QSettings("MyCompany", "XLIFF_AI_Assistant")
+        
+        # Load visibility
+        hidden_cols = settings.value("table_hidden_cols", [], type=list)
+        # Convert to int list (QSettings might return strings)
+        hidden_cols = [int(x) for x in hidden_cols if str(x).isdigit()]
+        
+        for i in range(7):
+            if i in hidden_cols:
+                self.setColumnHidden(i, True)
+            else:
+                self.setColumnHidden(i, False)
+                
+        # Load widths/state
+        state = settings.value("table_state")
+        if state:
+            self.horizontalHeader().restoreState(state)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -106,24 +173,26 @@ class ModernTranslationTable(QTableView):
         src_idx = self._proxy.mapToSource(idx)
         unit = self.units[src_idx.row()]
         
-        menu = QMenu(self)
+        # Use RoundMenu for consistent style
+        menu = RoundMenu(parent=self)
         
         # Actions
-        action_copy_src = QAction("📋 Copy Source to Target", self)
+        action_copy_src = Action("📋 Copy Source to Target", parent=self)
         action_copy_src.triggered.connect(lambda: self.copy_source_to_target(unit, src_idx))
         
-        action_revert = QAction("↩️ Revert to Original", self)
+        action_revert = Action("↩️ Revert to Original", parent=self)
         action_revert.triggered.connect(lambda: self.revert_segment(unit, src_idx))
         
         # Status Submenu
-        menu_status = menu.addMenu("🏳️ Set Status")
+        menu_status = RoundMenu(title="🏳️ Set Status", parent=menu)
         for status in ["translated", "needs_translation", "new", "locked"]:
-            a = QAction(status.capitalize(), self)
+            a = Action(status.capitalize(), parent=self)
             a.triggered.connect(lambda checked, s=status: self.set_status(unit, s, src_idx))
             menu_status.addAction(a)
             
         menu.addAction(action_copy_src)
         menu.addAction(action_revert)
+        menu.addMenu(menu_status)
         
         menu.exec(self.viewport().mapToGlobal(pos))
 

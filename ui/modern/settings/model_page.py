@@ -421,3 +421,8 @@ class ModelSettingsPage(QWidget):
             new_mappings[task] = combo.currentData()
             
         self.config.task_mappings = new_mappings
+        
+        # 4. Force Sync to Disk
+        self.config.sync()
+        
+        InfoBar.success("Settings Saved", "Model configurations have been updated.", parent=self)
