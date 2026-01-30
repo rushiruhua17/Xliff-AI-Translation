@@ -7,6 +7,10 @@ class RichTextDelegate(QStyledItemDelegate):
     Renders HTML content in TableView cells.
     Used for highlighting tags (e.g. <span style='color:blue'>{1}</span>)
     """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._doc = QTextDocument() # Reusable instance for performance
+
     def paint(self, painter, option, index):
         option.widget.style().drawControl(
             option.widget.style().ControlElement.CE_ItemViewItem, option, painter)
@@ -34,10 +38,10 @@ class RichTextDelegate(QStyledItemDelegate):
         painter.save()
         painter.translate(text_rect.topLeft())
         
-        doc = QTextDocument()
-        doc.setHtml(html_text)
-        doc.setTextWidth(text_rect.width())
-        doc.setDefaultFont(option.font)
+        # Reuse existing document object
+        self._doc.setHtml(html_text)
+        self._doc.setTextWidth(text_rect.width())
+        self._doc.setDefaultFont(option.font)
         
         # Color adjustment for selection
         if option.state & getattr(option.widget.style().StateFlag, 'State_Selected', 0):
@@ -45,18 +49,33 @@ class RichTextDelegate(QStyledItemDelegate):
              # For now keep it simple, Fluent style handles selection background
              pass
              
-        doc.drawContents(painter)
+        self._doc.drawContents(painter)
         painter.restore()
 
     def sizeHint(self, option, index):
         # We need to calculate height based on content
         text = index.data(Qt.ItemDataRole.DisplayRole)
-        if not text: return super().sizeHint(option, index)
+        if not text: 
+            return QSize(0, 30) # Minimum height
         
-        doc = QTextDocument()
-        doc.setHtml(str(text))
-        doc.setTextWidth(option.rect.width())
-        return QSize(int(doc.idealWidth()), int(doc.size().height()))
+        # Reuse existing document object
+        import re
+        html_text = re.sub(r'(\{\d+\})', r'<span style="color: #2196F3; font-weight: bold;">\1</span>', str(text))
+        html_text = html_text.replace("\n", "<br>")
+        
+        self._doc.setHtml(html_text)
+        
+        # Use a reasonable default width if option.rect.width() is 0 (initial load)
+        width = option.rect.width()
+        if width <= 0:
+            width = 300 # Default fallback
+            
+        self._doc.setTextWidth(width)
+        self._doc.setDefaultFont(option.font)
+        
+        # Add some padding
+        height = int(self._doc.size().height()) + 10 
+        return QSize(int(self._doc.idealWidth()), max(30, height))
 
 from PyQt6.QtCore import QSize
 

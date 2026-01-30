@@ -69,11 +69,19 @@ class ModernTranslationTable(QTableView):
         self.setColumnWidth(3, 40)
         self.setColumnWidth(4, 150)
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Re-calculate row heights when table width changes
+        # Use a timer to debounce and avoid performance issues during drag
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(100, self.resizeRowsToContents)
+
     def load_data(self, units):
         """Public API to load data"""
         self.units = units
         self._model.update_data(units)
         # Resize rows to fit content
+        # Force a layout update first to ensure column widths are valid
         self.resizeRowsToContents()
 
     def get_selected_unit(self):
