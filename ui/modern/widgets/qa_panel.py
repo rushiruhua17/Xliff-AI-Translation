@@ -3,7 +3,7 @@ from PyQt6.QtGui import QAction
 from PyQt6.QtCore import pyqtSignal
 from qfluentwidgets import (CardWidget, StrongBodyLabel, CaptionLabel, ProgressBar, 
                             PrimaryPushButton, SearchLineEdit, RadioButton, SegmentedWidget,
-                            ComboBox, ToolButton, FluentIcon)
+                            ComboBox, ToolButton, FluentIcon, ToolTipFilter, ToolTipPosition)
 
 class ModernQAPanel(QWidget):
     """
@@ -42,21 +42,23 @@ class ModernQAPanel(QWidget):
         
         layout.addWidget(self.stats_card)
         
-        # Language Selectors
-        self.combo_src = ComboBox()
-        self.combo_src.addItems(["en", "zh-CN", "ja", "de", "fr"])
-        self.combo_src.setToolTip("Source Language")
-        self.combo_src.setFixedWidth(80)
+        # Language Selectors (Hidden/ReadOnly in Project Workflow)
+        # We keep them initialized but hidden by default, or just remove them.
+        # User requested to remove them as they are set in Project Import.
+        # But we might want to show them as labels?
+        # Let's keep them but make them read-only or hidden.
+        # Actually, let's replace combos with labels for display only.
         
-        self.combo_tgt = ComboBox()
-        self.combo_tgt.addItems(["en", "zh-CN", "ja", "de", "fr"])
-        self.combo_tgt.setToolTip("Target Language")
-        self.combo_tgt.setFixedWidth(80)
+        self.lbl_langs = CaptionLabel("Src: ? -> Tgt: ?", self)
+        self.lbl_langs.setToolTip("Project Languages (Set in Project Settings)")
+        layout.addWidget(self.lbl_langs)
         
-        layout.addWidget(CaptionLabel("Src:", self))
-        layout.addWidget(self.combo_src)
-        layout.addWidget(CaptionLabel("Tgt:", self))
-        layout.addWidget(self.combo_tgt)
+        # Keep references to combos for compatibility if needed, or remove completely.
+        # To avoid breaking other code that references combo_src/tgt, we can mock them or keep hidden.
+        self.combo_src = ComboBox() # Hidden
+        self.combo_src.setVisible(False)
+        self.combo_tgt = ComboBox() # Hidden
+        self.combo_tgt.setVisible(False)
         
         # Filter Segment
         self.seg_filter = SegmentedWidget(self)
@@ -81,11 +83,15 @@ class ModernQAPanel(QWidget):
         
         # Actions
         self.btn_repair = PrimaryPushButton("🔧 Batch Repair", self)
+        # Apply ToolTipFilter for faster and styled tooltip
+        self.btn_repair.setToolTip("Automatically fix tag errors")
+        self.btn_repair.installEventFilter(ToolTipFilter(self.btn_repair, showDelay=50, position=ToolTipPosition.BOTTOM))
         layout.addWidget(self.btn_repair)
         
         # More Actions
         self.btn_more = ToolButton(FluentIcon.MORE, self)
         self.btn_more.setToolTip("More Actions")
+        self.btn_more.installEventFilter(ToolTipFilter(self.btn_more, showDelay=50, position=ToolTipPosition.BOTTOM))
         
         # Menu
         self.menu_more = QMenu(self)

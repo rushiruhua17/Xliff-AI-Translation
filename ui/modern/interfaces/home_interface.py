@@ -2,16 +2,17 @@ from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel
 from PyQt6.QtCore import Qt, pyqtSignal
 from qfluentwidgets import (SubtitleLabel, BodyLabel, CardWidget, IconWidget, 
                             PrimaryPushButton, SearchLineEdit, FluentIcon as FIF,
-                            ScrollArea)
+                            SingleDirectionScrollArea)
 
-class HomeInterface(ScrollArea):
+class HomeInterface(SingleDirectionScrollArea):
     """
     Home Interface: Recent files, Quick Actions, Project Overview.
     """
     open_file_clicked = pyqtSignal()
+    recent_file_clicked = pyqtSignal(str) # New signal for recent files
     
     def __init__(self, parent=None):
-        super().__init__(parent=parent)
+        super().__init__(parent=parent, orient=Qt.Orientation.Vertical)
         self.view = QWidget(self)
         self.setWidget(self.view)
         self.setWidgetResizable(True)
@@ -27,8 +28,6 @@ class HomeInterface(ScrollArea):
         
         self.v_layout.addStretch()
         
-        # Apply transparent background to scroll area
-        self.setStyleSheet("QScrollArea {background: transparent; border: none;}")
         self.view.setStyleSheet("background: transparent;")
 
     def init_header(self):
@@ -97,16 +96,41 @@ class HomeInterface(ScrollArea):
         self.v_layout.addSpacing(20)
         self.v_layout.addWidget(BodyLabel("Recent Files", self))
         
-        # Placeholder list
-        # In real app, this will be populated from QSettings
         self.recent_layout = QVBoxLayout()
         self.recent_layout.setSpacing(10)
         
-        # Example Item
-        # self.add_recent_item("manual_v2.xliff", "F:/Docs/manual_v2.xliff")
+        # Load from config
+        from core.config.app_config import AppConfig
+        config = AppConfig()
+        files = config.recent_files
+        
+        if not files:
+            self.recent_layout.addWidget(BodyLabel("No recent files found.", self).setStyleSheet("color: gray;"))
+        else:
+            for path in files:
+                import os
+                name = os.path.basename(path)
+                self.add_recent_item(name, path)
         
         self.v_layout.addLayout(self.recent_layout)
 
     def add_recent_item(self, name, path):
-        # Todo: Create a row widget for recent file
-        pass
+        # Create a simple clickable card or button
+        from qfluentwidgets import PushButton
+        btn = PushButton(f"{name}  ({path})", self)
+        btn.setStyleSheet("text-align: left; padding-left: 10px;")
+        btn.clicked.connect(lambda: self.open_recent_file(path))
+        self.recent_layout.addWidget(btn)
+
+    def open_recent_file(self, path):
+        # We need to signal main window to open this file
+        # But we only have open_file_clicked signal which takes no args
+        # Let's verify if path exists first
+        import os
+        if os.path.exists(path):
+            # Hack: emit signal, but we need a way to pass path
+            # Or add a new signal
+            self.recent_file_clicked.emit(path)
+        else:
+            # Show error?
+            pass

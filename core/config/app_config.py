@@ -115,3 +115,31 @@ class AppConfig:
 
     def sync(self):
         self.settings.sync()
+
+    @property
+    def recent_files(self) -> list:
+        """List of recently opened file paths."""
+        return self.settings.value("recent_files", [], type=list)
+
+    @recent_files.setter
+    def recent_files(self, value: list):
+        self.settings.setValue("recent_files", value)
+        
+    def add_recent_file(self, path: str):
+        """Add a file to recent list, maintaining MRU order and max size."""
+        current = self.recent_files
+        # Normalize path
+        path = path.replace("\\", "/")
+        
+        # Remove if exists (to move to top)
+        if path in current:
+            current.remove(path)
+            
+        # Insert at top
+        current.insert(0, path)
+        
+        # Limit to 10
+        if len(current) > 10:
+            current = current[:10]
+            
+        self.recent_files = current

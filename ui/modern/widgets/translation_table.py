@@ -1,7 +1,7 @@
 from PyQt6.QtWidgets import (QTableView, QHeaderView, QMenu, QMessageBox, QApplication)
 from PyQt6.QtCore import Qt, pyqtSignal, QPoint
 from PyQt6.QtGui import QAction, QCursor
-from qfluentwidgets import RoundMenu, Action
+from qfluentwidgets import RoundMenu, Action, SmoothScrollDelegate, SmoothScrollBar
 
 # Reuse existing core logic
 from core.xliff_model import XliffTableModel, XliffFilterProxyModel
@@ -37,6 +37,12 @@ class ModernTranslationTable(QTableView):
         self.setSortingEnabled(True)
         self.setWordWrap(True)
         self.setShowGrid(False) # Modern look
+        
+        # Apply Smooth Scrolling
+        self.scrollDelegate = SmoothScrollDelegate(self)
+        # Note: SmoothScrollBar in QFluentWidgets inherits from QWidget, not QScrollBar, 
+        # so it cannot be set directly via setVerticalScrollBar on a QTableView.
+        # We rely on the delegate for kinetics and basic styling.
         
         # Setup Columns & Delegates
         self.setup_columns()

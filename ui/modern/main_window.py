@@ -15,7 +15,7 @@ from PyQt6.QtCore import Qt, QSize, QTimer
 from PyQt6.QtWidgets import QApplication, QWidget, QMessageBox, QFileDialog
 from PyQt6.QtGui import QShortcut, QKeySequence
 from qfluentwidgets import (FluentWindow, NavigationItemPosition, FluentIcon as FIF,
-                            SplashScreen)
+                            SplashScreen, ToolTipFilter, ToolTipPosition)
 
 # Core Logic
 from core.parser import XliffParser
@@ -28,6 +28,7 @@ from core.config.app_config import AppConfig
 
 # Import Interfaces
 from ui.modern.interfaces.home_interface import HomeInterface
+from ui.modern.interfaces.project_interface import ProjectInterface
 from ui.modern.interfaces.editor_interface import EditorInterface
 from ui.modern.interfaces.settings_interface import SettingsInterface
 from ui.profile_wizard import ProfileWizardDialog
@@ -38,23 +39,46 @@ class ModernMainWindow(FluentWindow):
         self.setWindowTitle("XLIFF AI Assistant Pro")
         self.resize(1200, 800)
         
+        # Set App Icon (Use Robot icon for AI theme)
+        self.setWindowIcon(FIF.ROBOT.icon())
+        
         # Enable Mica (Win11)
         self.windowEffect.setMicaEffect(self.winId())
         
-        # Logic Components
+        # 0. Show Splash Screen immediately
+        self.splashScreen = SplashScreen(self.windowIcon(), self)
+        self.splashScreen.setIconSize(QSize(100, 100))
+        # self.splashScreen.setTitleBarVisible(False) # Optional (Not supported in this version)
+        
+        # Show the splash screen. Since the main window is not shown yet, 
+        # the splash screen will be visible. 
+        # But wait, FluentWindow usually needs to be shown for Splash to be centered?
+        # Actually, SplashScreen is a widget covering the window.
+        # So we need to show the window first?
+        # Let's follow standard pattern: show window, splash covers it.
+        # But we are in __init__. We can't show window yet.
+        # So we initialize splash here, and it will be shown when window.show() is called?
+        # No, we need to explicitly show it if we want it to appear during heavy init.
+        # However, we can't show a child widget if parent is hidden.
+        # Strategy: Do heavy init AFTER window is shown, using QTimer.singleShot(0, self.lazy_init)
+        
+        # Logic Components (Fast Init)
         self.config = AppConfig()
         self.parser = None
         self.abstractor = TagAbstractor()
         self.current_file_path = None
         self.autosaver = None
         self.current_profile = None # TranslationProfile
+        self.project_context = "" # Store context from ProjectInterface
         
         # Init Sub-Interfaces
         self.homeInterface = HomeInterface(self)
+        self.projectInterface = ProjectInterface(self)
         self.editorInterface = EditorInterface(self)
         self.settingsInterface = SettingsInterface(self)
         
         self.init_navigation()
+        self.configure_sidebar_tooltips() # Apply tooltip fix
         self.init_signals()
         self.init_shortcuts()
         
@@ -64,19 +88,47 @@ class ModernMainWindow(FluentWindow):
         self.qa_worker = None
         self.repair_worker = None
         self.sample_worker = None
+        
+        # Close Splash Screen after a delay (simulated loading)
+        # In real app, close it when data is ready
+        QTimer.singleShot(1500, self.splashScreen.finish)
 
     def init_navigation(self):
         self.addSubInterface(self.homeInterface, FIF.HOME, "Home")
+        self.addSubInterface(self.projectInterface, FIF.FOLDER, "Project")
         self.addSubInterface(self.editorInterface, FIF.EDIT, "Editor")
+        
+        # Initially hide Editor until project is loaded? 
+        # Or just keep it. FluentWindow manages stack.
+        # Let's keep it visible but maybe disable interactions if no file?
         
         self.navigationInterface.addSeparator()
         
         # We use a trick for Settings: Add a dummy widget, but hijack the click
         self.addSubInterface(self.settingsInterface, FIF.SETTING, "Settings", NavigationItemPosition.BOTTOM)
 
+    def configure_sidebar_tooltips(self):
+        """
+        Hack to apply ToolTipFilter to sidebar navigation items 
+        to reduce the default hover delay.
+        """
+        # Iterate over all child widgets of navigation interface
+        # NavigationItem is usually a QToolButton or similar
+        from PyQt6.QtWidgets import QAbstractButton
+        
+        buttons = self.navigationInterface.findChildren(QAbstractButton)
+        for btn in buttons:
+            # Check if it has a tooltip or is a nav item
+            # We install filter regardless to catch future tooltips
+            btn.installEventFilter(ToolTipFilter(btn, showDelay=50, position=ToolTipPosition.RIGHT))
+
     def init_signals(self):
         # Home Actions
-        self.homeInterface.open_file_clicked.connect(self.on_open_file)
+        self.homeInterface.open_file_clicked.connect(self.switch_to_project_tab)
+        self.homeInterface.recent_file_clicked.connect(self.load_recent_file)
+        
+        # Project Actions
+        self.projectInterface.start_project_clicked.connect(self.start_new_project)
         
         # Autosave Trigger (Listen to Model changes)
         self.editorInterface.table._model.dataChanged.connect(self.trigger_autosave)
@@ -92,6 +144,39 @@ class ModernMainWindow(FluentWindow):
         qa.btn_repair.clicked.connect(self.start_batch_repair)
         qa.request_profile_edit.connect(self.open_profile_wizard)
         qa.request_sample.connect(self.generate_sample)
+
+    def switch_to_project_tab(self):
+        self.switchTo(self.projectInterface)
+
+    def load_recent_file(self, path):
+        """Directly load a recent file, bypassing project wizard for now"""
+        # In future, we might want to store project context with the recent file entry
+        if self.load_file(path):
+            self.switchTo(self.editorInterface)
+
+    def start_new_project(self, path, settings):
+        """Called when user starts a project from ProjectInterface"""
+        self.project_context = settings.get("context", "")
+        
+        # Load File
+        if self.load_file(path):
+            # Apply Settings overrides
+            src = settings.get("source_lang")
+            tgt = settings.get("target_lang")
+            
+            # If Auto-Detect, we keep what parser found. Otherwise override.
+            if src and src != "Auto-Detect":
+                # Update parser or just UI? 
+                # For now just UI display in QA panel (which we might hide later)
+                # and internal state
+                pass
+                
+            # Switch to Editor
+            self.switchTo(self.editorInterface)
+            
+            # Inject Context into Workbench
+            if self.project_context:
+                self.editorInterface.workbench.append_message("System", f"<b>Project Context Loaded:</b><br>{self.project_context}")
 
     def open_profile_wizard(self):
         """Open the Profile Wizard Dialog"""
@@ -195,7 +280,7 @@ class ModernMainWindow(FluentWindow):
     def start_refinement(self, unit):
         try:
             client = self.get_client("translation") # Or specific refinement model
-            self.refine_worker = RefinementWorker(unit, client)
+            self.refine_worker = RefineWorker(unit, client)
             self.refine_worker.refined.connect(self.on_segment_refined)
             self.refine_worker.start()
         except Exception as e:
@@ -244,10 +329,15 @@ class ModernMainWindow(FluentWindow):
             
             # Extract Languages
             src_lang, tgt_lang = self.parser.get_languages()
-            if src_lang:
-                self.editorInterface.qa_panel.combo_src.setCurrentText(src_lang)
-            if tgt_lang:
-                self.editorInterface.qa_panel.combo_tgt.setCurrentText(tgt_lang)
+            # Update Info Label
+            if src_lang or tgt_lang:
+                s = src_lang if src_lang else "?"
+                t = tgt_lang if tgt_lang else "?"
+                self.editorInterface.qa_panel.lbl_langs.setText(f"Src: {s} -> Tgt: {t}")
+                
+                # Keep hidden combos synced for logic
+                if src_lang: self.editorInterface.qa_panel.combo_src.setCurrentText(src_lang)
+                if tgt_lang: self.editorInterface.qa_panel.combo_tgt.setCurrentText(tgt_lang)
             
             # 2. Abstract
             raw_units = self.parser.get_translation_units()
@@ -271,14 +361,18 @@ class ModernMainWindow(FluentWindow):
             # 4. Init Autosave
             self.autosaver = Autosaver(path)
             
-            # 5. Run Initial QA
+            # 5. Add to Recent Files
+            self.config.add_recent_file(path)
+            
+            # 6. Run Initial QA
             self.run_qa_check()
             
-            # 6. Switch View
-            self.switchTo(self.editorInterface)
+            # 7. Return success
+            return True
             
         except Exception as e:
             QMessageBox.critical(self, "Load Error", f"Failed to load file:\n{str(e)}")
+            return False
 
     def run_qa_check(self):
         """Runs QA checks on all units and updates UI"""
@@ -365,6 +459,17 @@ if __name__ == "__main__":
     logger.info("Modern UI Application starting...")
     
     app = QApplication(sys.argv)
+    
+    # Global Tooltip Configuration
+    # QToolTip.setShowDelay(0) is not available in PyQt6 directly.
+    # We rely on ToolTipFilter for specific widgets.
+    
     window = ModernMainWindow()
     window.show()
+    
+    # SplashScreen logic handled inside ModernMainWindow or here?
+    # Since ModernMainWindow is a FluentWindow, we can do it inside __init__
+    # or here. But we need to close it after initialization.
+    # Let's keep the logic inside ModernMainWindow to encapsulate it.
+    
     sys.exit(app.exec())
