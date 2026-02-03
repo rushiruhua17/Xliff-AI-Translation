@@ -51,15 +51,7 @@ flowchart TD
     G -- 否 --> I[导出 XLIFF]
 ```
 
-> **注意**: 如果上方图表无法渲染，工作流如下：
-> 1. **打开 XLIFF**: 导入从 CAT 工具导出的文件。
-> 2. **项目设置**: 配置受众、语调和术语策略，为 AI 引擎提供上下文。
-> 3. **AI 翻译核心**:
->    - **全量翻译**: 使用定义的配置文件批量处理整个文件。
->    - **精修**: 交互式地改进特定句段（例如“更简洁一点”、“修复语法”）。
-> 4. **QA 检查**: 验证标签完整性和空译文。
-> 5. **修复**: 自动或手动修复标签错误。
-> 6. **导出**: 保存合法的 XLIFF 以供重新导入。
+
 
 ---
 
@@ -118,15 +110,43 @@ flowchart TD
 
 ## 🔒 Tag 安全机制
 
-本项目把内联标签当成结构对象处理（类似 CAT 工具）：\n\n1. **用 lxml 解析 XLIFF**，提取每个 segment 的 inner XML：[parser.py](file:///f:/XLIFF%20AI%20Assistant/xliff_ai_assistant/core/parser.py)\n2. **内联标签抽象为占位符** `{1}`、`{2}`…，并保存每段独立的 `tags_map` 映射：[abstractor.py](file:///f:/XLIFF%20AI%20Assistant/xliff_ai_assistant/core/abstractor.py)、[xliff_inline_tags.py](file:///f:/XLIFF%20AI%20Assistant/xliff_ai_assistant/core/xliff_inline_tags.py)\n3. **Token-safe 翻译**：\n   - 含 `{n}` 的段落：按已知 `{n}` 切分文本块 → chunks 翻译（保留全上下文）→ 去除模型误产出的已知 `{n}` → 按原 token 序列确定性回拼\n   - 若模型 chunks 输出不合约：回退到传统“整段 JSON 翻译”\n   - 写入前强制结构校验（缺失/多余 token 不允许）\n   参考：[token_safe_translation.py](file:///f:/XLIFF%20AI%20Assistant/xliff_ai_assistant/core/token_safe_translation.py)、[workers.py](file:///f:/XLIFF%20AI%20Assistant/xliff_ai_assistant/core/workers.py)、[validator.py](file:///f:/XLIFF%20AI%20Assistant/xliff_ai_assistant/core/validator.py)\n4. **Repair（Fix Tags）** 只聚焦占位符修复，自动应用并重跑 QA：[repair.py](file:///f:/XLIFF%20AI%20Assistant/xliff_ai_assistant/core/repair.py)、[qa_service.py](file:///f:/XLIFF%20AI%20Assistant/xliff_ai_assistant/core/services/qa_service.py)\n5. **写回导出**：重建 XML 后用 lxml dummy-root 写回混合内容，保证稳定：[parser.py](file:///f:/XLIFF%20AI%20Assistant/xliff_ai_assistant/core/parser.py)\n@@
+本项目把内联标签当成结构对象处理（类似 CAT 工具）：
 
+1. **用 lxml 解析 XLIFF**，提取每个 segment 的 inner XML：[parser.py](file:///f:/XLIFF%20AI%20Assistant/xliff_ai_assistant/core/parser.py)
+2. **内联标签抽象为占位符** `{1}`、`{2}`…，并保存每段独立的 `tags_map` 映射：[abstractor.py](file:///f:/XLIFF%20AI%20Assistant/xliff_ai_assistant/core/abstractor.py)、[xliff_inline_tags.py](file:///f:/XLIFF%20AI%20Assistant/xliff_ai_assistant/core/xliff_inline_tags.py)
+3. **Token-safe 翻译**：
+   - 含 `{n}` 的段落：按已知 `{n}` 切分文本块 → chunks 翻译（保留全上下文）→ 去除模型误产出的已知 `{n}` → 按原 token 序列确定性回拼
+   - 若模型 chunks 输出不合约：回退到传统“整段 JSON 翻译”
+   - 写入前强制结构校验（缺失/多余 token 不允许）
+   - 参考：[token_safe_translation.py](file:///f:/XLIFF%20AI%20Assistant/xliff_ai_assistant/core/token_safe_translation.py)、[workers.py](file:///f:/XLIFF%20AI%20Assistant/xliff_ai_assistant/core/workers.py)、[validator.py](file:///f:/XLIFF%20AI%20Assistant/xliff_ai_assistant/core/validator.py)
+4. **Repair（Fix Tags）** 只聚焦占位符修复，自动应用并重跑 QA：[repair.py](file:///f:/XLIFF%20AI%20Assistant/xliff_ai_assistant/core/repair.py)、[qa_service.py](file:///f:/XLIFF%20AI%20Assistant/xliff_ai_assistant/core/services/qa_service.py)
+5. **写回导出**：重建 XML 后用 lxml dummy-root 写回混合内容，保证稳定：[parser.py](file:///f:/XLIFF%20AI%20Assistant/xliff_ai_assistant/core/parser.py)
 
-- **输入**: 标准 XLIFF 1.2 文件（常用工具：Trados, memoQ）。\n+- **UI**:\n+  - 现代 UI： [ui/modern/main_window.py](file:///f:/XLIFF%20AI%20Assistant/xliff_ai_assistant/ui/modern/main_window.py)\n+  - 旧版 UI（兼容/参考）：[desktop_app.py](file:///f:/XLIFF%20AI%20Assistant/xliff_ai_assistant/desktop_app.py)\n+- **核心**:\n+  - **Parser（lxml）**：[parser.py](file:///f:/XLIFF%20AI%20Assistant/xliff_ai_assistant/core/parser.py)\n+  - **Tag 抽象/还原**：[abstractor.py](file:///f:/XLIFF%20AI%20Assistant/xliff_ai_assistant/core/abstractor.py)\n+  - **QA / Repair**：[qa.py](file:///f:/XLIFF%20AI%20Assistant/xliff_ai_assistant/core/qa.py)、[repair.py](file:///f:/XLIFF%20AI%20Assistant/xliff_ai_assistant/core/repair.py)\n+  - **Workers（翻译/精修/Profile）**：[workers.py](file:///f:/XLIFF%20AI%20Assistant/xliff_ai_assistant/core/workers.py)\n+  - **自动保存**：[autosave.py](file:///f:/XLIFF%20AI%20Assistant/xliff_ai_assistant/core/autosave.py)\n+- **输出**: 验证过的 XLIFF 文件，可直接重新导入。\n@@
+---
+
+## 🏗 架构设计
+
+- **输入**: 标准 XLIFF 1.2 文件（常用工具：Trados, memoQ）。
+- **UI**:
+  - 现代 UI： [ui/modern/main_window.py](file:///f:/XLIFF%20AI%20Assistant/xliff_ai_assistant/ui/modern/main_window.py)
+  - 旧版 UI（兼容/参考）：[desktop_app.py](file:///f:/XLIFF%20AI%20Assistant/xliff_ai_assistant/desktop_app.py)
+- **核心**:
+  - **Parser（lxml）**：[parser.py](file:///f:/XLIFF%20AI%20Assistant/xliff_ai_assistant/core/parser.py)
+  - **Tag 抽象/还原**：[abstractor.py](file:///f:/XLIFF%20AI%20Assistant/xliff_ai_assistant/core/abstractor.py)
+  - **QA / Repair**：[qa.py](file:///f:/XLIFF%20AI%20Assistant/xliff_ai_assistant/core/qa.py)、[repair.py](file:///f:/XLIFF%20AI%20Assistant/xliff_ai_assistant/core/repair.py)
+  - **Workers（翻译/精修/Profile）**：[workers.py](file:///f:/XLIFF%20AI%20Assistant/xliff_ai_assistant/core/workers.py)
+  - **自动保存**：[autosave.py](file:///f:/XLIFF%20AI%20Assistant/xliff_ai_assistant/core/autosave.py)
+- **输出**: 验证过的 XLIFF 文件，可直接重新导入。
 
 ---
 前往 **Settings**（Model Services）进行配置：
 
-1. **模型档案（Model Profiles）**：配置多个 provider/base_url/model/api_key。\n+2. **任务映射（Task Mapping）**：为不同任务绑定 profile：\n+   - `translation`：翻译\n+   - `repair`：标签修复（Fix Tags / Batch Repair）\n+   - `profile_analysis`：生成翻译配置（可选）\n+   参考：[app_config.py](file:///f:/XLIFF%20AI%20Assistant/xliff_ai_assistant/core/config/app_config.py)、[model_page.py](file:///f:/XLIFF%20AI%20Assistant/xliff_ai_assistant/ui/modern/settings/model_page.py)\n@@
+1. **模型档案（Model Profiles）**：配置多个 provider/base_url/model/api_key。
+2. **任务映射（Task Mapping）**：为不同任务绑定 profile：
+   - `translation`：翻译
+   - `repair`：标签修复（Fix Tags / Batch Repair）
+   - `profile_analysis`：生成翻译配置（可选）
+   - 参考：[app_config.py](file:///f:/XLIFF%20AI%20Assistant/xliff_ai_assistant/core/config/app_config.py)、[model_page.py](file:///f:/XLIFF%20AI%20Assistant/xliff_ai_assistant/ui/modern/settings/model_page.py)
 
 > **安全提示**: API Key 本地存储在 `QSettings` (系统注册表/配置) 中。切勿将您的 Key 提交到版本控制。
 

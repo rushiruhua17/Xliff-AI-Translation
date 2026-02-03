@@ -50,17 +50,6 @@ flowchart TD
     H --> F
     G -- No --> I[Export XLIFF]
 ```
-
-> **Note**: If the diagram above does not render, the workflow is:
-> 1. **Open XLIFF**: Import file from your CAT tool.
-> 2. **Profile Setup**: Configure audience, tone, and terminology to guide the AI engine.
-> 3. **AI Translation Core**:
->    - **Translate All**: Batch process the entire file using the defined profile.
->    - **Refine**: Interactively improve specific segments (e.g., "Make it shorter", "Fix grammar").
-> 4. **QA Check**: Verify tag integrity and empty targets.
-> 5. **Repair**: Fix errors automatically or manually.
-> 6. **Export**: Save valid XLIFF for re-import.
-
 ---
 
 ## 🚀 Quick Start
