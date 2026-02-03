@@ -3,7 +3,8 @@ from PyQt6.QtGui import QAction
 from PyQt6.QtCore import pyqtSignal
 from qfluentwidgets import (CardWidget, StrongBodyLabel, CaptionLabel, ProgressBar, 
                             PrimaryPushButton, SearchLineEdit, RadioButton, SegmentedWidget,
-                            ComboBox, ToolButton, FluentIcon, ToolTipFilter, ToolTipPosition)
+                            ComboBox, ToolButton, FluentIcon as FIF, ToolTipFilter, ToolTipPosition,
+                            PushButton)
 
 class ModernQAPanel(QWidget):
     """
@@ -14,6 +15,7 @@ class ModernQAPanel(QWidget):
     filter_changed = pyqtSignal(str) # "All", "Untranslated", etc.
     search_changed = pyqtSignal(str) # text
     request_profile_edit = pyqtSignal()
+    request_batch_translation = pyqtSignal()
     request_sample = pyqtSignal()
     
     def __init__(self, parent=None):
@@ -74,6 +76,7 @@ class ModernQAPanel(QWidget):
         # Search Bar
         self.search_bar = SearchLineEdit(self)
         self.search_bar.setPlaceholderText("Search source or target...")
+        self.search_bar.setToolTip("Search text in source or target segments")
         self.search_bar.setFixedWidth(200)
         self.search_bar.textChanged.connect(self.search_changed)
         
@@ -82,26 +85,33 @@ class ModernQAPanel(QWidget):
         layout.addStretch()
         
         # Actions
-        self.btn_repair = PrimaryPushButton("🔧 Batch Repair", self)
-        # Apply ToolTipFilter for faster and styled tooltip
-        self.btn_repair.setToolTip("Automatically fix tag errors")
-        self.btn_repair.installEventFilter(ToolTipFilter(self.btn_repair, showDelay=50, position=ToolTipPosition.BOTTOM))
+        self.btn_translate_all = PrimaryPushButton("Translate All", self)
+        self.btn_translate_all.setIcon(FIF.LANGUAGE)
+        self.btn_translate_all.setToolTip("Batch translate all untranslated segments")
+        self.btn_translate_all.clicked.connect(self.request_batch_translation)
+        layout.addWidget(self.btn_translate_all)
+
+        self.btn_profile = ToolButton(FIF.PEOPLE, self)
+        self.btn_profile.setToolTip("Edit Translation Profile (Tone, Audience, etc.)")
+        self.btn_profile.clicked.connect(self.request_profile_edit)
+        layout.addWidget(self.btn_profile)
+
+        self.btn_repair = PushButton("Batch Repair", self)
+        self.btn_repair.setIcon(FIF.EDIT)
+        self.btn_repair.setToolTip("Automatically fix tag errors in all segments")
         layout.addWidget(self.btn_repair)
         
         # More Actions
-        self.btn_more = ToolButton(FluentIcon.MORE, self)
-        self.btn_more.setToolTip("More Actions")
+        self.btn_more = ToolButton(FIF.MORE, self)
+        self.btn_more.setToolTip("More Options")
         self.btn_more.installEventFilter(ToolTipFilter(self.btn_more, showDelay=50, position=ToolTipPosition.BOTTOM))
         
         # Menu
         self.menu_more = QMenu(self)
-        action_profile = QAction("📋 Edit Profile", self)
-        action_profile.triggered.connect(self.request_profile_edit)
         
         action_sample = QAction("🎲 Draft Sample", self)
         action_sample.triggered.connect(self.request_sample)
         
-        self.menu_more.addAction(action_profile)
         self.menu_more.addAction(action_sample)
         
         self.btn_more.setMenu(self.menu_more)

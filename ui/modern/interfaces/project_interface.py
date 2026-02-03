@@ -5,6 +5,8 @@ from qfluentwidgets import (SubtitleLabel, BodyLabel, PrimaryPushButton, LineEdi
                             CardWidget, EditableComboBox, StrongBodyLabel, FluentIcon as FIF,
                             TextEdit, ToolTipFilter, ToolTipPosition, SingleDirectionScrollArea)
 
+from ui.modern.widgets.profile_config_card import ProfileConfigCard
+
 class ProjectInterface(SingleDirectionScrollArea):
     """
     Project Interface:
@@ -29,6 +31,7 @@ class ProjectInterface(SingleDirectionScrollArea):
         self.init_header()
         self.init_file_selection()
         self.init_project_settings()
+        self.init_profile_settings()
         self.init_actions()
         
         self.v_layout.addStretch()
@@ -113,6 +116,11 @@ class ProjectInterface(SingleDirectionScrollArea):
         
         self.v_layout.addWidget(card)
 
+    def init_profile_settings(self):
+        self.v_layout.addSpacing(10)
+        self.profile_card = ProfileConfigCard(self.view, title="3. Edit Profile (Translation Style)")
+        self.v_layout.addWidget(self.profile_card)
+
     def init_actions(self):
         self.v_layout.addSpacing(20)
         
@@ -148,7 +156,8 @@ class ProjectInterface(SingleDirectionScrollArea):
         settings = {
             "source_lang": self.combo_src.currentText(),
             "target_lang": self.combo_tgt.currentText(),
-            "context": self.txt_context.toPlainText()
+            "context": self.txt_context.toPlainText(),
+            "profile": self.profile_card.get_current_profile()
         }
         
         self.start_project_clicked.emit(self.selected_file_path, settings)

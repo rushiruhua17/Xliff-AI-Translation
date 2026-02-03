@@ -15,7 +15,7 @@ from PyQt6.QtCore import Qt, QSize, QTimer
 from PyQt6.QtWidgets import QApplication, QWidget, QMessageBox, QFileDialog
 from PyQt6.QtGui import QShortcut, QKeySequence
 from qfluentwidgets import (FluentWindow, NavigationItemPosition, FluentIcon as FIF,
-                            SplashScreen, ToolTipFilter, ToolTipPosition)
+                            SplashScreen, ToolTipFilter, ToolTipPosition, NavigationAvatarWidget)
 
 # Core Logic
 from core.parser import XliffParser
@@ -31,7 +31,8 @@ from ui.modern.interfaces.home_interface import HomeInterface
 from ui.modern.interfaces.project_interface import ProjectInterface
 from ui.modern.interfaces.editor_interface import EditorInterface
 from ui.modern.interfaces.settings_interface import SettingsInterface
-from ui.profile_wizard import ProfileWizardDialog
+from ui.modern.interfaces.account_interface import AccountInterface
+from ui.modern.dialogs.profile_dialog import ProfileConfigDialog
 
 class ModernMainWindow(FluentWindow):
     def __init__(self):
@@ -76,6 +77,7 @@ class ModernMainWindow(FluentWindow):
         self.projectInterface = ProjectInterface(self)
         self.editorInterface = EditorInterface(self)
         self.settingsInterface = SettingsInterface(self)
+        self.accountInterface = AccountInterface(self)
         
         self.init_navigation()
         self.configure_sidebar_tooltips() # Apply tooltip fix
@@ -104,8 +106,23 @@ class ModernMainWindow(FluentWindow):
         
         self.navigationInterface.addSeparator()
         
+        # Add Avatar Widget (Account)
+        # We manually add the interface to the stack widget
+        self.stackedWidget.addWidget(self.accountInterface) 
+        
+        # Add the NavigationAvatarWidget to the bottom of the navigation interface
+        self.navigationInterface.addWidget(
+            routeKey=self.accountInterface.objectName(),
+            widget=NavigationAvatarWidget("Trae User", "resources/avatar_placeholder.png"),
+            onClick=self.on_avatar_clicked,
+            position=NavigationItemPosition.BOTTOM
+        )
+        
         # We use a trick for Settings: Add a dummy widget, but hijack the click
         self.addSubInterface(self.settingsInterface, FIF.SETTING, "Settings", NavigationItemPosition.BOTTOM)
+
+    def on_avatar_clicked(self):
+        self.switchTo(self.accountInterface)
 
     def configure_sidebar_tooltips(self):
         """
@@ -179,25 +196,94 @@ class ModernMainWindow(FluentWindow):
                 self.editorInterface.workbench.append_message("System", f"<b>Project Context Loaded:</b><br>{self.project_context}")
 
     def open_profile_wizard(self):
-        """Open the Profile Wizard Dialog"""
+        """Open the Profile Configuration Dialog"""
         # Ensure we have a profile object (create default if None)
         if not self.current_profile:
             from core.profile import TranslationProfile
             self.current_profile = TranslationProfile()
             
-        wiz = ProfileWizardDialog(self.current_profile, self)
-        if wiz.exec():
-            self.current_profile = wiz.get_profile()
+        # Use new ProfileConfigDialog
+        dlg = ProfileConfigDialog(self, self.current_profile)
+        if dlg.exec():
+            # Dialog handles saving internally to the passed profile object if we want, 
+            # but we also get it from signal or just access it.
+            # The dialog's accept() is triggered by save.
+            # We can update self.current_profile from dlg.profile if set
+            if dlg.profile:
+                self.current_profile = dlg.profile
             QMessageBox.information(self, "Profile Updated", "Translation profile has been updated.")
             
+    def on_batch_translate_requested(self):
+        """Handle batch translation request with profile check"""
+        # 1. Check Profile
+        if not self.is_profile_configured():
+            # Show Warning
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Profile Not Configured")
+            msg.setText("Translation Profile is missing or incomplete.")
+            msg.setInformativeText("The profile settings (Tone, Audience, etc.) significantly affect the translation quality.\n\nIt is strongly recommended to configure the profile before AI translation.")
+            msg.setIcon(QMessageBox.Icon.Warning)
+            
+            btn_config = msg.addButton("Configure Profile", QMessageBox.ButtonRole.ActionRole)
+            btn_continue = msg.addButton("Continue Anyway", QMessageBox.ButtonRole.DestructiveRole)
+            msg.addButton(QMessageBox.StandardButton.Cancel)
+            
+            msg.exec()
+            
+            if msg.clickedButton() == btn_config:
+                self.open_profile_wizard()
+                # Recursive call? Or just return and let user click again?
+                # Better to just return, user can click Translate again after config.
+                return
+            elif msg.clickedButton() == btn_continue:
+                pass # Proceed
+            else:
+                return # Cancel
+        
+        # 2. Start Batch Translation (Mock for now or reuse start_translation loop)
+        self.start_batch_translation_logic()
+
+    def is_profile_configured(self):
+        """Check if profile has meaningful settings"""
+        if not self.current_profile:
+            return False
+        # Check if brief is default
+        brief = self.current_profile.brief
+        if not brief.target_audience and brief.tone == "neutral" and not brief.style_guide_notes:
+            return False
+        return True
+
+    def start_batch_translation_logic(self):
+        """Iterate over units and translate untranslated ones"""
+        # This would be a loop using TranslationWorker
+        # For this task, I'll just show a message or start a mock process
+        # Real implementation would queue all units
+        
+        units_to_translate = [u for u in self.editorInterface.table.units if not u.target]
+        count = len(units_to_translate)
+        
+        if count == 0:
+             QMessageBox.information(self, "Batch Translation", "No untranslated segments found.")
+             return
+
+        self.editorInterface.workbench.append_message("System", f"Starting batch translation for {count} segments...")
+        # In a real app, we'd start the worker here. 
+        # For now, just a toast
+        QMessageBox.information(self, "Batch Translation", f"Batch translation started for {count} segments.\n(Logic implementation pending)")
+
     def generate_sample(self):
         """Run Sample Translation"""
         if not self.editorInterface.table.units:
             return
             
         qa = self.editorInterface.qa_panel
-        src = qa.combo_src.currentText()
-        tgt = qa.combo_tgt.currentText()
+        # Removed combo boxes, need to get lang from Parser or Config
+        src = "en" # Default fallback
+        tgt = "zh" 
+        if self.parser:
+            s, t = self.parser.get_languages()
+            if s: src = s
+            if t: tgt = t
         
         try:
             client_config = self.get_client_config("translation")
@@ -329,15 +415,15 @@ class ModernMainWindow(FluentWindow):
             
             # Extract Languages
             src_lang, tgt_lang = self.parser.get_languages()
-            # Update Info Label
-            if src_lang or tgt_lang:
-                s = src_lang if src_lang else "?"
-                t = tgt_lang if tgt_lang else "?"
-                self.editorInterface.qa_panel.lbl_langs.setText(f"Src: {s} -> Tgt: {t}")
+            # Update Info Label - Removed from QA Panel as per user request
+            # if src_lang or tgt_lang:
+            #     s = src_lang if src_lang else "?"
+            #     t = tgt_lang if tgt_lang else "?"
+            #     self.editorInterface.qa_panel.lbl_langs.setText(f"Src: {s} -> Tgt: {t}")
                 
-                # Keep hidden combos synced for logic
-                if src_lang: self.editorInterface.qa_panel.combo_src.setCurrentText(src_lang)
-                if tgt_lang: self.editorInterface.qa_panel.combo_tgt.setCurrentText(tgt_lang)
+            #     # Keep hidden combos synced for logic
+            #     if src_lang: self.editorInterface.qa_panel.combo_src.setCurrentText(src_lang)
+            #     if tgt_lang: self.editorInterface.qa_panel.combo_tgt.setCurrentText(tgt_lang)
             
             # 2. Abstract
             raw_units = self.parser.get_translation_units()

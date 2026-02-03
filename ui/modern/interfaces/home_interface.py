@@ -5,6 +5,7 @@ from qfluentwidgets import (SubtitleLabel, BodyLabel, CardWidget, IconWidget,
                             SingleDirectionScrollArea)
 
 class HomeInterface(SingleDirectionScrollArea):
+
     """
     Home Interface: Recent files, Quick Actions, Project Overview.
     """
