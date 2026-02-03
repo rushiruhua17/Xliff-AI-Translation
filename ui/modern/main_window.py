@@ -330,6 +330,8 @@ class ModernMainWindow(FluentWindow):
             self.trans_worker.progress.connect(self.on_batch_progress)
             self.trans_worker.finished.connect(lambda: self.editorInterface.qa_panel.finish_translation_progress("Translation done"))
             self.trans_worker.finished.connect(lambda: self.editorInterface.sidebar.append_message("System", "Batch translation complete."))
+            if hasattr(self.trans_worker, "info"):
+                self.trans_worker.info.connect(lambda m: self.editorInterface.sidebar.append_message("System", m))
             
             # Handle Error
             self.trans_worker.error.connect(lambda e: self.editorInterface.workbench.append_message("System", f"Error: {e}"))
@@ -440,18 +442,27 @@ class ModernMainWindow(FluentWindow):
             self.run_ai_self_test()
             return
 
-        unit = self.editorInterface.table.get_selected_unit()
-        if not unit:
+        selected_units = self.editorInterface.table.get_selected_units()
+        if not selected_units:
             return
         
         if action == "translate":
-            self.start_translation(unit)
+            if len(selected_units) == 1:
+                self.start_translation(selected_units[0])
+            else:
+                self.start_translation_units(selected_units)
         elif action == "refine":
-            self.start_refinement(unit)
+            if len(selected_units) != 1:
+                self.editorInterface.sidebar.append_message("System", "Refine only supports single selection.")
+                return
+            self.start_refinement(selected_units[0])
         elif action == "fix_tags":
-            self.start_fix_tags(unit)
+            self.start_fix_tags_units(selected_units)
         elif action == "formalize":
-            self.on_sidebar_command("Make it formal", unit)
+            if len(selected_units) != 1:
+                self.editorInterface.sidebar.append_message("System", "This command only supports single selection.")
+                return
+            self.on_sidebar_command("Make it formal", selected_units[0])
 
     def run_ai_self_test(self):
         self.editorInterface.sidebar.append_message("System", "Running AI self-test...")
@@ -477,7 +488,11 @@ class ModernMainWindow(FluentWindow):
     def on_sidebar_command(self, text, unit=None):
         """Handle AI command (instruction)"""
         if not unit:
-            unit = self.editorInterface.table.get_selected_unit()
+            selected_units = self.editorInterface.table.get_selected_units()
+            if len(selected_units) != 1:
+                self.editorInterface.sidebar.append_message("System", "This command only supports single selection.")
+                return
+            unit = selected_units[0]
         if not unit:
             return
 
@@ -521,9 +536,33 @@ class ModernMainWindow(FluentWindow):
             self.trans_worker.batch_finished.connect(lambda results: self.on_single_translated(unit, results))
             self.trans_worker.progress.connect(lambda c, t: self.editorInterface.sidebar.lbl_tip.setText(f"Translating: {c}/{t}"))
             self.trans_worker.error.connect(lambda e: self.editorInterface.sidebar.append_message("System", f"Error: {e}"))
+            if hasattr(self.trans_worker, "info"):
+                self.trans_worker.info.connect(lambda m: self.editorInterface.sidebar.append_message("System", m))
             self.trans_worker.start()
             self.editorInterface.sidebar.lbl_tip.setText("Translating...")
             self.editorInterface.sidebar.append_message("System", "Translate started.")
+        except Exception as e:
+            QMessageBox.critical(self, "Config Error", str(e))
+
+    def start_translation_units(self, units):
+        try:
+            client = self.get_client("translation")
+            src = "en"
+            tgt = "zh"
+            if self.parser:
+                s, t = self.parser.get_languages()
+                if s: src = s
+                if t: tgt = t
+
+            self.trans_worker = TranslationWorker(units, client, src, tgt, self.current_profile)
+            self.trans_worker.batch_finished.connect(self.on_batch_translated)
+            self.trans_worker.progress.connect(lambda c, t: self.editorInterface.sidebar.lbl_tip.setText(f"Translating: {c}/{t}"))
+            self.trans_worker.error.connect(lambda e: self.editorInterface.sidebar.append_message("System", f"Error: {e}"))
+            if hasattr(self.trans_worker, "info"):
+                self.trans_worker.info.connect(lambda m: self.editorInterface.sidebar.append_message("System", m))
+            self.trans_worker.start()
+            self.editorInterface.sidebar.lbl_tip.setText("Translating...")
+            self.editorInterface.sidebar.append_message("System", f"Translate started ({len(units)} segments).")
         except Exception as e:
             QMessageBox.critical(self, "Config Error", str(e))
 
@@ -577,9 +616,9 @@ class ModernMainWindow(FluentWindow):
         try:
             client = self.get_client("repair")
             
-            unit = self.editorInterface.table.get_selected_unit()
-            if unit:
-                units = [unit]
+            selected_units = self.editorInterface.table.get_selected_units()
+            if selected_units:
+                units = selected_units
             else:
                 units = [u for u in self.editorInterface.table.units if getattr(u, "qa_status", "") == "error"]
 
@@ -599,16 +638,21 @@ class ModernMainWindow(FluentWindow):
             QMessageBox.critical(self, "Config Error", str(e))
 
     def start_fix_tags(self, unit):
+        self.start_fix_tags_units([unit])
+
+    def start_fix_tags_units(self, units):
+        if not units:
+            return
         try:
             client = self.get_client("repair")
-            self._repair_units_by_id = {str(unit.id): unit}
-            self.repair_worker = RepairWorker([unit], client)
+            self._repair_units_by_id = {str(u.id): u for u in units}
+            self.repair_worker = RepairWorker(units, client)
             self.repair_worker.segment_repaired.connect(self.on_repair_segment_repaired)
             self.repair_worker.error.connect(lambda e: self.editorInterface.sidebar.append_message("System", f"Repair Error: {e}"))
             self.repair_worker.finished.connect(self.on_repair_finished)
             self.repair_worker.start()
             self.editorInterface.sidebar.lbl_tip.setText("Repairing tags...")
-            self.editorInterface.sidebar.append_message("System", "Fix tags started.")
+            self.editorInterface.sidebar.append_message("System", f"Fix tags started ({len(units)} segments).")
         except Exception as e:
             QMessageBox.critical(self, "Config Error", str(e))
 

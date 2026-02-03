@@ -68,6 +68,7 @@ class EditorInterface(QWidget):
         
         # Wire Signals
         self.table.selection_changed.connect(self.on_selection_changed)
+        self.table.selection_count_changed.connect(self.on_selection_count_changed)
         
         # Workbench (Legacy reference for compatibility)
         # We map sidebar to workbench property to minimize breakage in main_window.py
@@ -81,8 +82,10 @@ class EditorInterface(QWidget):
         
     def on_selection_changed(self, unit):
         # Update Sidebar Context
-        # TODO: Support multi-selection count
-        self.sidebar.update_context(1 if unit else 0)
+        self.sidebar.update_context(len(self.table.get_selected_units()))
+
+    def on_selection_count_changed(self, count: int):
+        self.sidebar.update_context(count)
 
     def load_data(self, units):
         """Pass data to the table widget"""

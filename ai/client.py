@@ -93,6 +93,57 @@ class LLMClient:
             # Fallback to mock or empty on error to not crash UI
             return self._mock_translate(segments)
 
+    def translate_text_chunks(
+        self,
+        source_full: str,
+        chunks: List[str],
+        source_lang: str,
+        target_lang: str,
+        system_prompt: str = None,
+    ) -> List[str]:
+        if not self.client:
+            time.sleep(0.2)
+            return [f"[Mock] {c}" if c else "" for c in (chunks or [])]
+
+        system_content = system_prompt or (
+            "You are a professional translator. Output strictly valid JSON."
+        )
+
+        payload = {
+            "source_lang": source_lang,
+            "target_lang": target_lang,
+            "source_full": source_full,
+            "chunks": chunks,
+            "output_schema": {"chunks": ["translated chunk strings, same length as input chunks"]},
+            "rules": [
+                "Translate each chunk using the full source_full as context.",
+                "Return JSON only. No markdown.",
+                "The output must contain key 'chunks' with the same length as input chunks.",
+                "Do not include or invent placeholder tokens like {1}, {2} in chunk translations.",
+            ],
+        }
+
+        try:
+            messages = [
+                {"role": "system", "content": system_content},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ]
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=0.2,
+                response_format={"type": "json_object"},
+            )
+
+            content = response.choices[0].message.content
+            data = self._parse_json(content)
+            if isinstance(data, dict) and isinstance(data.get("chunks"), list):
+                return [str(x) for x in data.get("chunks")]
+            return []
+        except Exception as e:
+            logger.error(f"LLM Chunk Translation Error: {e}", exc_info=True)
+            return [c for c in (chunks or [])]
+
     def _parse_json(self, text: str) -> Any:
         """Robustly parse JSON from LLM response, handling markdown blocks."""
         text = text.strip()

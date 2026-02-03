@@ -5,6 +5,8 @@ from core.xliff_obj import TranslationUnit
 from core.prompt_builder import PromptBuilder
 from core.profile import TranslationProfile
 from core.prompts import SystemPrompts
+from core.token_safe_translation import split_by_known_tokens, reassemble_from_chunks, strip_known_tokens
+from core.validator import Validator
 import json
 
 class TranslationWorker(QThread):
@@ -12,6 +14,7 @@ class TranslationWorker(QThread):
     batch_finished = pyqtSignal(dict) # NEW: Emit {id_str: translation}
     finished = pyqtSignal()
     error = pyqtSignal(str)
+    info = pyqtSignal(str)
 
     def __init__(self, units: List[TranslationUnit], client, source_lang: str, target_lang: str, profile=None):
         super().__init__()
@@ -26,8 +29,6 @@ class TranslationWorker(QThread):
         try:
             print(f"[TranslationWorker] Starting batch translation for {len(self.units)} units.")
             total = len(self.units)
-            # Batch translate in chunks of 10 to provide progress updates
-            batch_size = 10
             
             # Generate System Prompt ONCE based on Profile
             print("[TranslationWorker] Building system prompt...")
@@ -35,38 +36,79 @@ class TranslationWorker(QThread):
                 self.profile, self.source_lang, self.target_lang
             )
             print(f"[TranslationWorker] System Prompt: {system_instruction[:100]}...")
-            
-            for i in range(0, total, batch_size):
+
+            validator = Validator()
+            success_map: Dict[str, str] = {}
+
+            for idx, u in enumerate(self.units):
                 if not self.is_running:
                     print("[TranslationWorker] Worker stopped.")
                     break
-                    
-                batch = self.units[i:i + batch_size]
-                print(f"[TranslationWorker] Processing batch {i} to {i+batch_size}")
-                
-                # Use PromptBuilder to format user message
-                segments = [{"id": u.id, "source": u.source_abstracted} for u in batch]
-                
-                print(f"[TranslationWorker] Calling client.translate_batch with {len(segments)} segments")
-                results = self.client.translate_batch(
-                    segments, 
-                    self.source_lang, 
-                    self.target_lang,
-                    system_prompt=system_instruction # Inject here
-                )
-                print(f"[TranslationWorker] Received {len(results)} results")
-                
-                # Map results back to units
-                res_map = {str(res["id"]): res["translation"] for res in results}
-                
-                # Debug logging
-                if not res_map and results:
-                    print(f"[Worker] Warning: res_map empty but results exist. Keys: {[r.get('id') for r in results]}")
 
-                # Emit results to main thread instead of modifying directly
-                self.batch_finished.emit(res_map)
-                
-                self.progress.emit(min(i + batch_size, total), total)
+                source_full = u.source_abstracted or ""
+                tags_map = getattr(u, "tags_map", {}) or {}
+
+                split = split_by_known_tokens(source_full, tags_map)
+                has_tokens = len(split.tokens) > 0
+
+                rebuilt = None
+
+                if has_tokens:
+                    chunks = split.text_chunks
+                    tokens = split.tokens
+
+                    translated_chunks = self.client.translate_text_chunks(
+                        source_full=source_full,
+                        chunks=chunks,
+                        source_lang=self.source_lang,
+                        target_lang=self.target_lang,
+                        system_prompt=None,
+                    )
+
+                    if isinstance(translated_chunks, list) and len(translated_chunks) == len(chunks):
+                        cleaned_chunks = [strip_known_tokens(str(c), tags_map) for c in translated_chunks]
+                        rebuilt = reassemble_from_chunks(cleaned_chunks, tokens)
+                    else:
+                        msg = f"Chunk translation invalid for unit {u.id}; falling back to legacy translation."
+                        print(f"[TranslationWorker] {msg}")
+                        self.info.emit(msg)
+
+                if rebuilt is None:
+                    results = self.client.translate_batch(
+                        [{"id": u.id, "source": source_full}],
+                        self.source_lang,
+                        self.target_lang,
+                        system_prompt=system_instruction,
+                    )
+                    res_map = {str(res.get("id")): res.get("translation") for res in (results or [])}
+                    rebuilt = res_map.get(str(u.id))
+                    if rebuilt is None:
+                        msg = f"Legacy translation failed for unit {u.id}; skipping apply."
+                        print(f"[TranslationWorker] {msg}")
+                        self.info.emit(msg)
+                        self.progress.emit(idx + 1, total)
+                        continue
+
+                probe = TranslationUnit(
+                    id=str(u.id),
+                    source_raw="",
+                    target_raw="",
+                    state=u.state,
+                )
+                probe.source_abstracted = source_full
+                probe.target_abstracted = rebuilt
+
+                structural_errors = validator.validate_structure(probe)
+                if structural_errors:
+                    msg = f"Structural validation failed for unit {u.id}: {structural_errors}"
+                    print(f"[TranslationWorker] {msg}")
+                    self.info.emit(msg)
+                    self.progress.emit(idx + 1, total)
+                    continue
+
+                success_map[str(u.id)] = rebuilt
+                self.batch_finished.emit({str(u.id): rebuilt})
+                self.progress.emit(idx + 1, total)
             
             self.finished.emit()
             print("[TranslationWorker] Finished.")

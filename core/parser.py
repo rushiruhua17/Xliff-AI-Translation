@@ -1,7 +1,6 @@
 from lxml import etree
 from typing import List, Optional
 import os
-import re
 from .xliff_obj import TranslationUnit
 from .logger import get_logger
 
@@ -143,13 +142,36 @@ class XliffParser:
         if node is None:
             return ""
         
+        def clone_without_ns(n):
+            if isinstance(n, etree._Comment):
+                c = etree.Comment(n.text or "")
+                c.tail = n.tail
+                return c
+            if isinstance(n, etree._ProcessingInstruction):
+                pi = etree.ProcessingInstruction(n.target, n.text or "")
+                pi.tail = n.tail
+                return pi
+
+            if not isinstance(n.tag, str):
+                return n
+
+            tag_local = etree.QName(n).localname
+            new = etree.Element(tag_local)
+            for k, v in (n.attrib or {}).items():
+                if isinstance(k, str) and k.startswith("{"):
+                    new.set(etree.QName(k).localname, v)
+                else:
+                    new.set(k, v)
+            new.text = n.text
+            new.tail = n.tail
+            for ch in n:
+                new.append(clone_without_ns(ch))
+            return new
+
         parts = []
         if node.text:
             parts.append(node.text)
         for child in node:
-            # Convert child to string including tail text
-            child_str = etree.tostring(child, encoding='unicode', with_tail=True)
-            # Remove all namespace declarations to keep it clean for AI/Abstractor
-            child_str = re.sub(r'\s+xmlns(:\w+)?="[^"]+"', '', child_str)
-            parts.append(child_str)
+            clean = clone_without_ns(child)
+            parts.append(etree.tostring(clean, encoding="unicode", with_tail=True))
         return "".join(parts)

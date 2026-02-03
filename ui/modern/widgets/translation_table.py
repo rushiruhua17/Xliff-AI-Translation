@@ -15,6 +15,7 @@ class ModernTranslationTable(QTableView):
     
     # Signals for external interaction (Loose Coupling)
     selection_changed = pyqtSignal(object) # Emits TranslationUnit object
+    selection_count_changed = pyqtSignal(int)
     status_toggled = pyqtSignal(int) # Emits unit_id
     
     def __init__(self, parent=None):
@@ -34,7 +35,7 @@ class ModernTranslationTable(QTableView):
         # Style & Behavior
         self.setAlternatingRowColors(True)
         self.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
-        self.setSelectionMode(QTableView.SelectionMode.SingleSelection)
+        self.setSelectionMode(QTableView.SelectionMode.ExtendedSelection)
         self.verticalHeader().setVisible(False)
         self.setSortingEnabled(True)
         self.setWordWrap(True)
@@ -51,6 +52,7 @@ class ModernTranslationTable(QTableView):
         
         # Signals
         self.selectionModel().currentRowChanged.connect(self.on_row_changed)
+        self.selectionModel().selectionChanged.connect(self.on_selection_changed)
         self._model.dataChanged.connect(self.on_model_data_changed)
         
         # Context Menu
@@ -167,6 +169,24 @@ class ModernTranslationTable(QTableView):
         src_idx = self._proxy.mapToSource(idx)
         return self.units[src_idx.row()]
 
+    def get_selected_units(self):
+        sm = self.selectionModel()
+        if not sm:
+            return []
+        rows = sm.selectedRows(0)
+        if not rows:
+            return []
+
+        selected = []
+        for proxy_idx in sorted(rows, key=lambda x: x.row()):
+            src_idx = self._proxy.mapToSource(proxy_idx)
+            if not src_idx.isValid():
+                continue
+            r = src_idx.row()
+            if 0 <= r < len(self.units):
+                selected.append(self.units[r])
+        return selected
+
     def on_row_changed(self, current, previous):
         if not current.isValid(): return
         
@@ -174,6 +194,9 @@ class ModernTranslationTable(QTableView):
         if src_idx.isValid():
             unit = self.units[src_idx.row()]
             self.selection_changed.emit(unit)
+
+    def on_selection_changed(self, selected, deselected):
+        self.selection_count_changed.emit(len(self.get_selected_units()))
 
     def show_context_menu(self, pos: QPoint):
         idx = self.indexAt(pos)
