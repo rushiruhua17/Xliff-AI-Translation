@@ -1,6 +1,6 @@
-from PyQt6.QtWidgets import QStyledItemDelegate
-from PyQt6.QtGui import QTextDocument, QAbstractTextDocumentLayout, QPalette, QIcon, QPixmap, QPainter
-from PyQt6.QtCore import Qt, QRectF
+from PyQt6.QtWidgets import QStyledItemDelegate, QStyle, QPlainTextEdit
+from PyQt6.QtGui import QTextDocument, QAbstractTextDocumentLayout, QPalette, QIcon, QPixmap, QPainter, QColor
+from PyQt6.QtCore import Qt, QRectF, QSize, QEvent
 
 class RichTextDelegate(QStyledItemDelegate):
     """
@@ -17,7 +17,7 @@ class RichTextDelegate(QStyledItemDelegate):
 
         # Shift text slightly
         icon = index.data(Qt.ItemDataRole.DecorationRole)
-        text_rect = option.rect
+        text_rect = QRectF(option.rect)
         if icon:
             text_rect.setLeft(text_rect.left() + option.decorationSize.width() + 4)
 
@@ -77,7 +77,124 @@ class RichTextDelegate(QStyledItemDelegate):
         height = int(self._doc.size().height()) + 10 
         return QSize(int(self._doc.idealWidth()), max(30, height))
 
-from PyQt6.QtCore import QSize
+class PendingDiffDelegate(RichTextDelegate):
+    """
+    Renders Target column.
+    If pending_target exists:
+    - Shows Diff (Green text for new)
+    - Draws Accept (Check) and Reject (X) buttons
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.btn_size = 24
+        self.spacing = 4
+        
+    def paint(self, painter, option, index):
+        # 1. Get Unit Data
+        unit = index.data(Qt.ItemDataRole.UserRole)
+        
+        # If no unit (or standard string), fallback to super
+        if not unit or not hasattr(unit, 'pending_target') or not unit.pending_target:
+            super().paint(painter, option, index)
+            return
+
+        option.widget.style().drawControl(
+            option.widget.style().ControlElement.CE_ItemViewItem, option, painter)
+
+        painter.save()
+        import re
+        pending = re.sub(r'(\{\d+\})', r'<span style="color: #2196F3; font-weight: bold;">\1</span>', str(unit.pending_target))
+        pending = pending.replace("\n", "<br>")
+        html_text = f"<span style='color:#2E7D32; font-weight:bold;'>{pending}</span>"
+        
+        # Draw Text (Reuse logic but with custom rect)
+        # We need to reserve space for buttons on the right
+        text_rect = QRectF(option.rect)
+        text_rect.setWidth(text_rect.width() - (self.btn_size * 2 + self.spacing * 3))
+        
+        self._doc.setHtml(html_text)
+        self._doc.setTextWidth(text_rect.width())
+        self._doc.setDefaultFont(option.font)
+        
+        painter.translate(text_rect.topLeft())
+        self._doc.drawContents(painter)
+        painter.translate(-text_rect.topLeft().x(), -text_rect.topLeft().y()) # Reset translation
+        
+        # 4. Render Buttons (Accept/Reject)
+        # Accept Button (Green Check)
+        btn_accept_rect = self.get_accept_rect(option.rect)
+        self.draw_button(painter, btn_accept_rect, "✓", "#4CAF50", "#FFFFFF")
+        
+        # Reject Button (Red X)
+        btn_reject_rect = self.get_reject_rect(option.rect)
+        self.draw_button(painter, btn_reject_rect, "✕", "#F44336", "#FFFFFF")
+        
+        painter.restore()
+
+    def draw_button(self, painter, rect, text, bg, fg):
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(bg))
+        painter.drawRoundedRect(rect, 4, 4)
+        
+        painter.setPen(QColor(fg))
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
+
+    def get_accept_rect(self, rect):
+        # Right aligned
+        return QRectF(rect.right() - self.btn_size - self.spacing, 
+                      rect.top() + (rect.height() - self.btn_size) / 2, 
+                      self.btn_size, self.btn_size)
+
+    def get_reject_rect(self, rect):
+        # Left of Accept
+        return QRectF(rect.right() - (self.btn_size * 2) - (self.spacing * 2), 
+                      rect.top() + (rect.height() - self.btn_size) / 2, 
+                      self.btn_size, self.btn_size)
+
+    def editorEvent(self, event, model, option, index):
+        # Handle Clicks
+        if event.type() == QEvent.Type.MouseButtonRelease:
+            unit = index.data(Qt.ItemDataRole.UserRole)
+            if unit and unit.pending_target:
+                pos = event.position()
+                if self.get_accept_rect(option.rect).contains(pos):
+                    if self.parent():
+                        self.parent().accept_pending(unit)
+                    return True
+                elif self.get_reject_rect(option.rect).contains(pos):
+                    if self.parent():
+                        self.parent().reject_pending(unit)
+                    return True
+        return super().editorEvent(event, model, option, index)
+
+    def sizeHint(self, option, index):
+        # Override to ensure enough height for buttons and text
+        unit = index.data(Qt.ItemDataRole.UserRole)
+        if unit and unit.pending_target:
+            # Calculate height for pending text
+            import re
+            pending = re.sub(r'(\{\d+\})', r'<span style="color: #2196F3; font-weight: bold;">\1</span>', str(unit.pending_target))
+            pending = pending.replace("\n", "<br>")
+            self._doc.setHtml(f"<span style='color:#2E7D32; font-weight:bold;'>{pending}</span>")
+            self._doc.setTextWidth(option.rect.width() - 60)
+            h = self._doc.size().height() + 10
+            return QSize(int(option.rect.width()), max(40, int(h)))
+        return super().sizeHint(option, index)
+
+    def createEditor(self, parent, option, index):
+        editor = QPlainTextEdit(parent)
+        editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        editor.setFrameShape(QPlainTextEdit.Shape.NoFrame)
+        return editor
+
+    def setEditorData(self, editor, index):
+        editor.setPlainText(index.data(Qt.ItemDataRole.EditRole) or "")
+
+    def setModelData(self, editor, model, index):
+        model.setData(index, editor.toPlainText(), Qt.ItemDataRole.EditRole)
+
+    def updateEditorGeometry(self, editor, option, index):
+        editor.setGeometry(option.rect)
 
 class StatusDelegate(QStyledItemDelegate):
     """
@@ -89,8 +206,6 @@ class StatusDelegate(QStyledItemDelegate):
             option.widget.style().ControlElement.CE_ItemViewItem, option, painter)
             
         status = index.data(Qt.ItemDataRole.DisplayRole) # Model returns emoji currently
-        # We should probably map emoji back to status string or use unit.state if we had access
-        # But for now, let's just render the text centered
         
         painter.save()
         painter.drawText(option.rect, Qt.AlignmentFlag.AlignCenter, status)

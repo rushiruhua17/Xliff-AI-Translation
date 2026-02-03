@@ -24,6 +24,9 @@ class TranslationUnit:
     qa_status: str = "ok" # ok, warning, error
     qa_details: Dict[str, List[str]] = field(default_factory=dict) # {"missing": ["{0}"], "extra": ["{99}"]}
     
+    # Pending Edit State (for AI Review)
+    pending_target: Optional[str] = None # Proposed AI translation, None if no pending edit
+    
     def to_dict(self):
         return {
             "id": self.id,

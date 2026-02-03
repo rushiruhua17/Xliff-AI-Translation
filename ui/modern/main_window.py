@@ -152,15 +152,15 @@ class ModernMainWindow(FluentWindow):
         
         # Workbench Actions
         wb = self.editorInterface.workbench
-        wb.request_translation.connect(self.start_translation)
-        wb.request_refinement.connect(self.start_refinement)
-        wb.apply_changes.connect(self.apply_workbench_changes)
+        wb.request_action.connect(self.on_sidebar_action)
+        wb.request_command.connect(self.on_sidebar_command)
         
         # QA Actions
         qa = self.editorInterface.qa_panel
         qa.btn_repair.clicked.connect(self.start_batch_repair)
         qa.request_profile_edit.connect(self.open_profile_wizard)
         qa.request_sample.connect(self.generate_sample)
+        qa.request_batch_translation.connect(self.on_batch_translate_requested)
 
     def switch_to_project_tab(self):
         self.switchTo(self.projectInterface)
@@ -204,6 +204,17 @@ class ModernMainWindow(FluentWindow):
             
         # Use new ProfileConfigDialog
         dlg = ProfileConfigDialog(self, self.current_profile)
+        
+        # Connect Auto-Detect Signal
+        # ProfileConfigDialog wraps ProfileConfigCard. We need access to the card.
+        # But ProfileConfigDialog doesn't expose card signal directly?
+        # Let's check profile_dialog.py content.
+        # Assuming we can access dlg.card or need to modify dialog.
+        # If dialog doesn't expose it, we can findChild or modify dialog.
+        # For now, let's assume dlg.card is accessible or we add a property.
+        if hasattr(dlg, 'profile_card'):
+            dlg.profile_card.request_auto_detect.connect(lambda: self.run_auto_detect_worker(dlg.profile_card))
+        
         if dlg.exec():
             # Dialog handles saving internally to the passed profile object if we want, 
             # but we also get it from signal or just access it.
@@ -212,6 +223,41 @@ class ModernMainWindow(FluentWindow):
             if dlg.profile:
                 self.current_profile = dlg.profile
             QMessageBox.information(self, "Profile Updated", "Translation profile has been updated.")
+
+    def run_auto_detect_worker(self, card_widget):
+        """Runs the ProfileGeneratorWorker using current file content"""
+        if not self.parser or not self.parser.get_translation_units():
+            QMessageBox.warning(self, "Auto-Detect", "No file loaded or file is empty.")
+            card_widget.on_auto_detect_finished()
+            return
+            
+        # Get Sample Text (Limit to 1500 chars to speed up AI)
+        units = self.parser.get_translation_units()[:50] 
+        full_text = "\n".join([u.source_raw for u in units])
+        if len(full_text) > 1500:
+            full_text = full_text[:1500] + "\n...(truncated)"
+        
+        try:
+            from core.workers import ProfileGeneratorWorker
+            client_config = self.get_client_config("profile_analysis") 
+            
+            self.profile_worker = ProfileGeneratorWorker(full_text, client_config)
+            self.profile_worker.finished.connect(lambda p: self.on_profile_generated(p, card_widget))
+            self.profile_worker.error.connect(lambda e: self.on_profile_error(e, card_widget))
+            self.profile_worker.start()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Config Error", str(e))
+            card_widget.on_auto_detect_finished()
+
+    def on_profile_generated(self, profile, card_widget):
+        card_widget.load_profile(profile)
+        card_widget.on_auto_detect_finished()
+        QMessageBox.information(self, "Auto-Detect", "Profile suggestions loaded!")
+
+    def on_profile_error(self, error, card_widget):
+        QMessageBox.warning(self, "AI Error", f"Failed to detect profile: {error}")
+        card_widget.on_auto_detect_finished()
             
     def on_batch_translate_requested(self):
         """Handle batch translation request with profile check"""
@@ -255,11 +301,8 @@ class ModernMainWindow(FluentWindow):
 
     def start_batch_translation_logic(self):
         """Iterate over units and translate untranslated ones"""
-        # This would be a loop using TranslationWorker
-        # For this task, I'll just show a message or start a mock process
-        # Real implementation would queue all units
-        
-        units_to_translate = [u for u in self.editorInterface.table.units if not u.target]
+        # Collect untranslated units
+        units_to_translate = [u for u in self.editorInterface.table.units if not u.target_abstracted]
         count = len(units_to_translate)
         
         if count == 0:
@@ -267,9 +310,52 @@ class ModernMainWindow(FluentWindow):
              return
 
         self.editorInterface.workbench.append_message("System", f"Starting batch translation for {count} segments...")
-        # In a real app, we'd start the worker here. 
-        # For now, just a toast
-        QMessageBox.information(self, "Batch Translation", f"Batch translation started for {count} segments.\n(Logic implementation pending)")
+
+        src = "en"
+        tgt = "zh"
+        if self.parser:
+            s, t = self.parser.get_languages()
+            if s: src = s
+            if t: tgt = t
+
+        self.editorInterface.qa_panel.start_translation_progress(count)
+
+        try:
+            client = self.get_client("translation")
+            self.trans_worker = TranslationWorker(units_to_translate, client, src, tgt, self.current_profile)
+            
+            # Connect Signals
+            self.trans_worker.batch_finished.connect(self.on_batch_translated)
+            
+            self.trans_worker.progress.connect(self.on_batch_progress)
+            self.trans_worker.finished.connect(lambda: self.editorInterface.qa_panel.finish_translation_progress("Translation done"))
+            self.trans_worker.finished.connect(lambda: self.editorInterface.sidebar.append_message("System", "Batch translation complete."))
+            
+            # Handle Error
+            self.trans_worker.error.connect(lambda e: self.editorInterface.workbench.append_message("System", f"Error: {e}"))
+            self.trans_worker.error.connect(lambda e: self.editorInterface.qa_panel.finish_translation_progress(f"Error"))
+            
+            self.trans_worker.start()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Config Error", str(e))
+            self.editorInterface.qa_panel.finish_translation_progress("Error")
+
+    def on_batch_progress(self, current, total):
+        self.editorInterface.qa_panel.update_translation_progress(current, total)
+        self.editorInterface.sidebar.lbl_tip.setText(f"Translating: {current}/{total}")
+        self.editorInterface.sidebar.append_message("System", f"Progress {current}/{total}")
+
+    def on_batch_translated(self, results: dict):
+        if not results:
+            return
+        units_by_id = {str(u.id): u for u in self.editorInterface.table.units}
+        for unit_id, target in results.items():
+            u = units_by_id.get(str(unit_id))
+            if not u:
+                continue
+            u.pending_target = target
+            self.editorInterface.table.refresh_unit(u)
 
     def generate_sample(self):
         """Run Sample Translation"""
@@ -306,7 +392,7 @@ class ModernMainWindow(FluentWindow):
         # Helper to get raw config dict for workers that init their own client
         p = self.config.get_profile_by_task(task)
         if not p:
-             raise ValueError(f"No model configured for task: {task}")
+             raise ValueError(f"No model configured for task: {task}. {self._describe_model_config_state()}")
         return {
             "api_key": p.get("api_key"),
             "base_url": p.get("base_url"),
@@ -328,7 +414,7 @@ class ModernMainWindow(FluentWindow):
         # For now duplicating simply:
         p = self.config.get_profile_by_task(task)
         if not p:
-             raise ValueError(f"No model configured for task: {task}")
+             raise ValueError(f"No model configured for task: {task}. {self._describe_model_config_state()}")
         
         from ai.client import LLMClient
         return LLMClient(
@@ -338,44 +424,137 @@ class ModernMainWindow(FluentWindow):
             provider=p.get("provider", "custom")
         )
 
+    def _describe_model_config_state(self) -> str:
+        try:
+            mappings = self.config.task_mappings or {}
+            configured_tasks = sorted([k for k, v in mappings.items() if v])
+            mapping_keys = sorted(list(mappings.keys()))
+            profiles_count = len(self.config.model_profiles or [])
+            return f"(task_mappings keys={mapping_keys}, configured={configured_tasks}, profiles={profiles_count})"
+        except Exception:
+            return "(model config state unavailable)"
+
+    def on_sidebar_action(self, action):
+        """Handle quick actions from sidebar"""
+        if action == "self_test":
+            self.run_ai_self_test()
+            return
+
+        unit = self.editorInterface.table.get_selected_unit()
+        if not unit:
+            return
+        
+        if action == "translate":
+            self.start_translation(unit)
+        elif action == "refine":
+            self.start_refinement(unit)
+        elif action == "fix_tags":
+            self.start_fix_tags(unit)
+        elif action == "formalize":
+            self.on_sidebar_command("Make it formal", unit)
+
+    def run_ai_self_test(self):
+        self.editorInterface.sidebar.append_message("System", "Running AI self-test...")
+        from core.workers import TestConnectionWorker
+
+        self._test_workers = []
+        for task in ["translation", "repair", "profile_analysis"]:
+            try:
+                client = self.get_client(task)
+            except Exception as e:
+                self.editorInterface.sidebar.append_message("System", f"{task}: config error: {e}")
+                continue
+
+            w = TestConnectionWorker(client)
+            w.finished.connect(lambda ok, msg, t=task: self.on_ai_test_finished(t, ok, msg))
+            w.start()
+            self._test_workers.append(w)
+
+    def on_ai_test_finished(self, task: str, ok: bool, msg: str):
+        status = "OK" if ok else "FAIL"
+        self.editorInterface.sidebar.append_message("System", f"{task}: {status} - {msg}")
+
+    def on_sidebar_command(self, text, unit=None):
+        """Handle AI command (instruction)"""
+        if not unit:
+            unit = self.editorInterface.table.get_selected_unit()
+        if not unit:
+            return
+
+        try:
+            client = self.get_client("translation")
+            from core.workers import WorkbenchWorker
+
+            payload = {
+                "source": unit.source_abstracted,
+                "target": unit.target_abstracted or "",
+                "tokens": list(unit.tags_map.keys()) if hasattr(unit, "tags_map") and unit.tags_map else [],
+                "instruction": text
+            }
+
+            self.wb_worker = WorkbenchWorker(client, payload)
+            self.wb_worker.finished.connect(lambda res: self.on_workbench_result(unit, res))
+            self.wb_worker.error.connect(lambda e: self.editorInterface.sidebar.append_message("System", f"AI Error: {e}"))
+            self.wb_worker.start()
+            self.editorInterface.sidebar.lbl_tip.setText("AI processing...")
+            self.editorInterface.sidebar.append_message("System", f"Command sent: {text}")
+        except Exception as e:
+            QMessageBox.critical(self, "Config Error", str(e))
+
+    def on_workbench_result(self, unit, result_text: str):
+        unit.pending_target = result_text
+        self.editorInterface.table.refresh_unit(unit)
+        self.editorInterface.sidebar.lbl_tip.setText("Patch generated. Review pending changes.")
+        self.editorInterface.sidebar.append_message("AI", "Patch generated.")
+
     def start_translation(self, unit):
         try:
             client = self.get_client("translation")
-            # Need context tokens? 
-            # In a real app we'd get them from Profile or Analysis
-            # For now passing empty tokens
-            
-            self.trans_worker = TranslationWorker([unit], client, {}, self.config.settings)
-            self.trans_worker.segment_translated.connect(self.on_segment_translated)
-            self.trans_worker.error.connect(lambda e: self.editorInterface.workbench.append_message("System", f"Error: {e}"))
+            src = "en"
+            tgt = "zh"
+            if self.parser:
+                s, t = self.parser.get_languages()
+                if s: src = s
+                if t: tgt = t
+
+            self.trans_worker = TranslationWorker([unit], client, src, tgt, self.current_profile)
+            self.trans_worker.batch_finished.connect(lambda results: self.on_single_translated(unit, results))
+            self.trans_worker.progress.connect(lambda c, t: self.editorInterface.sidebar.lbl_tip.setText(f"Translating: {c}/{t}"))
+            self.trans_worker.error.connect(lambda e: self.editorInterface.sidebar.append_message("System", f"Error: {e}"))
             self.trans_worker.start()
+            self.editorInterface.sidebar.lbl_tip.setText("Translating...")
+            self.editorInterface.sidebar.append_message("System", "Translate started.")
         except Exception as e:
             QMessageBox.critical(self, "Config Error", str(e))
 
-    def on_segment_translated(self, unit_id, target, state):
-        # Find unit and update
-        # Since we passed the unit object, we can update it directly?
-        # But thread safety... TranslationWorker emits ID.
-        # We need to find unit by ID
-        # For single unit translation, we know it's the current one in workbench
-        wb = self.editorInterface.workbench
-        if wb.current_unit and wb.current_unit.id == unit_id:
-            wb.txt_target.setText(target)
-            wb.append_message("AI", f"Translation: {target}")
+    def on_single_translated(self, unit, results: dict):
+        if not results:
+            return
+        key = str(unit.id)
+        if key not in results:
+            return
+        unit.pending_target = results[key]
+        self.editorInterface.table.refresh_unit(unit)
+        self.editorInterface.sidebar.lbl_tip.setText("Translation proposed. Review pending changes.")
+        self.editorInterface.sidebar.append_message("AI", "Translation proposed.")
 
     def start_refinement(self, unit):
         try:
-            client = self.get_client("translation") # Or specific refinement model
-            self.refine_worker = RefineWorker(unit, client)
-            self.refine_worker.refined.connect(self.on_segment_refined)
+            client = self.get_client("translation")
+            instruction = self.editorInterface.sidebar.txt_input.toPlainText().strip() or "Improve fluency and naturalness."
+            self.refine_worker = RefineWorker(client, unit.source_abstracted, unit.target_abstracted or "", instruction)
+            self.refine_worker.finished.connect(lambda text: self.on_segment_refined(unit, text))
+            self.refine_worker.error.connect(lambda e: self.editorInterface.sidebar.append_message("System", f"Refine Error: {e}"))
             self.refine_worker.start()
+            self.editorInterface.sidebar.lbl_tip.setText("Refining...")
         except Exception as e:
             QMessageBox.critical(self, "Config Error", str(e))
 
-    def on_segment_refined(self, new_text, explanation):
-        wb = self.editorInterface.workbench
-        wb.txt_target.setText(new_text)
-        wb.append_message("AI", f"Refined: {new_text}<br><i>Reason: {explanation}</i>")
+    def on_segment_refined(self, unit, new_text):
+        unit.pending_target = new_text
+        self.editorInterface.table.refresh_unit(unit)
+        self.editorInterface.sidebar.lbl_tip.setText("Refinement proposed. Review pending changes.")
+        self.editorInterface.sidebar.append_message("AI", "Refinement proposed.")
 
     def apply_workbench_changes(self, unit, new_text):
         # Update Table
@@ -394,8 +573,66 @@ class ModernMainWindow(FluentWindow):
         self.editorInterface.workbench.append_message("System", "Applied to table.")
 
     def start_batch_repair(self):
-        # Logic similar to desktop_app.py batch_auto_repair
-        pass # To be implemented fully, reusing RepairWorker
+        """Start batch repair for all units with errors"""
+        try:
+            client = self.get_client("repair")
+            
+            unit = self.editorInterface.table.get_selected_unit()
+            if unit:
+                units = [unit]
+            else:
+                units = [u for u in self.editorInterface.table.units if getattr(u, "qa_status", "") == "error"]
+
+            if not units:
+                QMessageBox.information(self, "Batch Repair", "No broken segments found.")
+                return
+
+            self._repair_units_by_id = {str(u.id): u for u in units}
+            self.repair_worker = RepairWorker(units, client)
+            self.repair_worker.segment_repaired.connect(self.on_repair_segment_repaired)
+            self.repair_worker.error.connect(lambda e: self.editorInterface.sidebar.append_message("System", f"Repair Error: {e}"))
+            self.repair_worker.finished.connect(self.on_repair_finished)
+            self.repair_worker.start()
+            self.editorInterface.sidebar.lbl_tip.setText("Repairing tags...")
+                
+        except Exception as e:
+            QMessageBox.critical(self, "Config Error", str(e))
+
+    def start_fix_tags(self, unit):
+        try:
+            client = self.get_client("repair")
+            self._repair_units_by_id = {str(unit.id): unit}
+            self.repair_worker = RepairWorker([unit], client)
+            self.repair_worker.segment_repaired.connect(self.on_repair_segment_repaired)
+            self.repair_worker.error.connect(lambda e: self.editorInterface.sidebar.append_message("System", f"Repair Error: {e}"))
+            self.repair_worker.finished.connect(self.on_repair_finished)
+            self.repair_worker.start()
+            self.editorInterface.sidebar.lbl_tip.setText("Repairing tags...")
+            self.editorInterface.sidebar.append_message("System", "Fix tags started.")
+        except Exception as e:
+            QMessageBox.critical(self, "Config Error", str(e))
+
+    def on_repair_segment_repaired(self, unit_id, fixed_text, state):
+        u = None
+        if hasattr(self, "_repair_units_by_id"):
+            u = self._repair_units_by_id.get(str(unit_id))
+        if not u:
+            u = next((x for x in self.editorInterface.table.units if str(x.id) == str(unit_id)), None)
+        if not u:
+            return
+        u.target_abstracted = fixed_text
+        u.pending_target = None
+        u.state = "edited"
+        self.editorInterface.table.refresh_unit(u)
+        from core.services.qa_service import QAService
+        QAService.check_batch([u])
+        self.refresh_qa_panel()
+        self.editorInterface.sidebar.lbl_tip.setText("Tags fixed and applied.")
+
+    def on_repair_finished(self, ok, fail):
+        self.refresh_qa_panel()
+        self.editorInterface.sidebar.append_message("System", f"Repair finished: ok={ok}, fail={fail}")
+        self.editorInterface.sidebar.lbl_tip.setText("Repair finished.")
 
     def init_shortcuts(self):
         QShortcut(QKeySequence("Ctrl+S"), self, self.save_current_file)
@@ -466,29 +703,26 @@ class ModernMainWindow(FluentWindow):
         
         # Run QA synchronously (it's fast for local checks)
         QAService.check_batch(self.editorInterface.table.units)
-        
-        # Update UI Stats
+        self.refresh_qa_panel()
+
+    def refresh_qa_panel(self):
         errors = len([u for u in self.editorInterface.table.units if u.qa_status == "error"])
         warnings = len([u for u in self.editorInterface.table.units if u.qa_status == "warning"])
-        
-        # Update QA Panel
+
         self.editorInterface.qa_panel.lbl_stats.setText(f"Errors: {errors} | Warnings: {warnings}")
-        
-        # Update Health Bar
+
         total = len(self.editorInterface.table.units)
         if total > 0:
             health = max(0, 100 - (errors * 5) - (warnings * 1))
             self.editorInterface.qa_panel.progress.setValue(health)
-            
-            # Color logic
+
             if errors > 0:
                 self.editorInterface.qa_panel.progress.setStyleSheet("QProgressBar::chunk { background-color: #F44336; }")
             elif warnings > 0:
                 self.editorInterface.qa_panel.progress.setStyleSheet("QProgressBar::chunk { background-color: #FFC107; }")
             else:
                 self.editorInterface.qa_panel.progress.setStyleSheet("QProgressBar::chunk { background-color: #4CAF50; }")
-        
-        # Refresh Table View to show QA icons
+
         self.editorInterface.table.viewport().update()
 
     def save_current_file(self):

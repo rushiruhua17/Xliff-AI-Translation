@@ -18,7 +18,7 @@ PROVIDER_DATA = {
         "icon": FluentIcon.GLOBE
     },
     "DeepSeek": {
-        "base_url": "https://api.deepseek.com",
+        "base_url": "https://api.deepseek.com/v1",
         "help_url": "https://platform.deepseek.com/api_keys",
         "default_models": ["deepseek-chat", "deepseek-reasoner"],
         "icon": FluentIcon.CHAT
@@ -48,6 +48,42 @@ PROVIDER_DATA = {
         "icon": FluentIcon.EDIT
     }
 }
+
+def collect_task_mappings(task_combos: dict) -> dict:
+    new_mappings = {}
+    for task, combo in (task_combos or {}).items():
+        if hasattr(combo, "count") and combo.count() <= 0:
+            raise ValueError(
+                f"Task '{task}' has no available models. Please enable a provider and add models first.\n"
+                f"任务“{task}”没有可选模型，请先启用 Provider 并添加模型。"
+            )
+
+        data = combo.currentData() if hasattr(combo, "currentData") else None
+        if not data and hasattr(combo, "currentIndex") and hasattr(combo, "setCurrentIndex") and hasattr(combo, "itemData"):
+            idx = combo.currentIndex()
+            if idx is None or idx < 0:
+                combo.setCurrentIndex(0)
+                idx = 0
+            data = combo.itemData(idx)
+
+        if not data and hasattr(combo, "currentText"):
+            text = combo.currentText() or ""
+            if " - " in text:
+                provider, model = text.split(" - ", 1)
+                provider = provider.strip()
+                model = model.strip()
+                if provider and model:
+                    data = f"{provider}_{model}"
+
+        if not data:
+            raise ValueError(
+                f"No default model selected for task: {task}. Please select one and save.\n"
+                f"任务“{task}”未选择默认模型，请先选择并保存。"
+            )
+
+        new_mappings[task] = data
+
+    return new_mappings
 
 class ModelSettingsPage(QWidget):
     """
@@ -112,6 +148,9 @@ class ModelSettingsPage(QWidget):
         
         layout.addWidget(SubtitleLabel("Default Models by Task", w))
         layout.addWidget(BodyLabel("Assign specific models to different tasks for optimal cost/performance.", w))
+        lbl_save_hint = BodyLabel("Changes take effect after clicking Save. 修改后请点击保存才会生效。", w)
+        lbl_save_hint.setStyleSheet("color: gray; font-size: 12px;")
+        layout.addWidget(lbl_save_hint)
         layout.addSpacing(10)
         
         self.task_combos = {}
@@ -137,7 +176,9 @@ class ModelSettingsPage(QWidget):
             
             c_layout.addLayout(header)
             c_layout.addWidget(BodyLabel(desc, card))
-            c_layout.addWidget(BodyLabel(f"Recommended: {hint}", card).setStyleSheet("color: gray; font-size: 12px;"))
+            lbl_hint = BodyLabel(f"Recommended: {hint}", card)
+            lbl_hint.setStyleSheet("color: gray; font-size: 12px;")
+            c_layout.addWidget(lbl_hint)
             
             layout.addWidget(card)
             
@@ -166,6 +207,10 @@ class ModelSettingsPage(QWidget):
         h_layout.addStretch()
         switch = SwitchButton("Enable")
         switch.setChecked(False) # Default disabled
+        for signal_name in ("checkedChanged", "toggled"):
+            if hasattr(switch, signal_name):
+                getattr(switch, signal_name).connect(lambda *_: self.refresh_default_combos())
+                break
         h_layout.addWidget(switch)
         layout.addLayout(h_layout)
         
@@ -202,7 +247,9 @@ class ModelSettingsPage(QWidget):
         base_url.setPlaceholderText("https://...")
         base_url.setText(data.get("base_url", ""))
         layout.addWidget(base_url)
-        layout.addWidget(BodyLabel("Leave unchanged for official endpoints.", w).setStyleSheet("color: gray; font-size: 12px;"))
+        lbl_tip = BodyLabel("Leave unchanged for official endpoints.", w)
+        lbl_tip.setStyleSheet("color: gray; font-size: 12px;")
+        layout.addWidget(lbl_tip)
         
         # Update test button to use base_url
         # We use a wrapper to access the latest text
@@ -246,11 +293,13 @@ class ModelSettingsPage(QWidget):
         text, ok = QInputDialog.getText(self, "Add Model", "Model ID (e.g. gpt-4o):")
         if ok and text:
             list_widget.addItem(text)
+            self.refresh_default_combos()
 
     def remove_model_from_list(self, list_widget):
         row = list_widget.currentRow()
         if row >= 0:
             list_widget.takeItem(row)
+            self.refresh_default_combos()
 
     def on_sidebar_changed(self, row):
         self.content_stack.setCurrentIndex(row)
@@ -387,6 +436,7 @@ class ModelSettingsPage(QWidget):
 
     def save_settings(self):
         """Collect data and save to AppConfig"""
+        self.refresh_default_combos()
         new_profiles = []
         
         # 1. Generate Profiles from UI state
@@ -416,9 +466,7 @@ class ModelSettingsPage(QWidget):
         self.config.model_profiles = new_profiles
         
         # 3. Save Mappings
-        new_mappings = {}
-        for task, combo in self.task_combos.items():
-            new_mappings[task] = combo.currentData()
+        new_mappings = collect_task_mappings(self.task_combos)
             
         self.config.task_mappings = new_mappings
         

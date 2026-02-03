@@ -36,6 +36,8 @@ class TestAutosaveIntegration(unittest.TestCase):
         
         # 3. Save patch
         self.autosaver.save_patch(units)
+
+        self.autosaver.save(units)
         
         # 4. Check file existence
         autosave_path = self.autosaver.autosave_path

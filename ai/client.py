@@ -14,17 +14,25 @@ logger = get_logger(__name__)
 
 class LLMClient:
     def __init__(self, api_key: str = None, base_url: str = None, model: str = "gpt-3.5-turbo", provider: str = "custom"):
+        if os.getenv("MOCK_LLM", "").strip() in {"1", "true", "True"}:
+            provider = "mock"
         self.api_key = api_key or os.getenv("LLM_API_KEY")
         self.base_url = base_url or os.getenv("LLM_BASE_URL")
         self.model = model
         self.provider = provider
         
         self.client = None
-        if self.provider == "custom" and self.api_key:
-            if OpenAI:
-                self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
-            else:
+        if self.provider != "mock":
+            if not OpenAI:
                 logger.warning("OpenAI library not installed.")
+            elif not self.base_url:
+                logger.warning("No base_url provided, cannot initialize LLM client.")
+            else:
+                key = self.api_key
+                if not key and self.provider in {"ollama"}:
+                    key = "ollama"
+                if key:
+                    self.client = OpenAI(api_key=key, base_url=self.base_url)
 
     @property
     def chat(self):
@@ -36,7 +44,7 @@ class LLMClient:
     def translate_batch(self, segments: List[Dict[str, str]], source_lang: str, target_lang: str, system_prompt: str = None) -> List[Dict[str, str]]:
         if not self.client:
             # Fallback to mock if no client (or if key missing)
-            logger.warning("No API Key provided, using Mock mode.")
+            logger.warning("LLM client not initialized, using Mock mode.")
             return self._mock_translate(segments)
 
         # Use provided system_prompt OR fallback to default

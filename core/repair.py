@@ -3,7 +3,7 @@ import re
 
 class RepairWorker(QThread):
     progress = pyqtSignal(int, int)  # current, total
-    segment_repaired = pyqtSignal(int, str, str) # NEW: Emit (id, target, state)
+    segment_repaired = pyqtSignal(str, str, str) # NEW: Emit (id, target, state)
     finished = pyqtSignal(int, int)  # repaired_count, failed_count
     error = pyqtSignal(str)
     

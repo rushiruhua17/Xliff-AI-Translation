@@ -1,11 +1,11 @@
 from PyQt6.QtWidgets import (QTableView, QHeaderView, QMenu, QMessageBox, QApplication)
-from PyQt6.QtCore import Qt, pyqtSignal, QPoint
+from PyQt6.QtCore import Qt, pyqtSignal, QPoint, QTimer
 from PyQt6.QtGui import QAction, QCursor
 from qfluentwidgets import RoundMenu, Action, SmoothScrollDelegate, SmoothScrollBar
 
 # Reuse existing core logic
 from core.xliff_model import XliffTableModel, XliffFilterProxyModel
-from ui.delegates import RichTextDelegate, StatusDelegate
+from ui.delegates import RichTextDelegate, StatusDelegate, PendingDiffDelegate
 
 class ModernTranslationTable(QTableView):
     """
@@ -28,6 +28,8 @@ class ModernTranslationTable(QTableView):
         self._proxy.setSourceModel(self._model)
         
         self.setModel(self._proxy)
+
+        self._pending_resize_rows = set()
         
         # Style & Behavior
         self.setAlternatingRowColors(True)
@@ -49,6 +51,7 @@ class ModernTranslationTable(QTableView):
         
         # Signals
         self.selectionModel().currentRowChanged.connect(self.on_row_changed)
+        self._model.dataChanged.connect(self.on_model_data_changed)
         
         # Context Menu
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -58,7 +61,7 @@ class ModernTranslationTable(QTableView):
         # Set Delegates
         self.setItemDelegateForColumn(1, StatusDelegate(self))
         self.setItemDelegateForColumn(5, RichTextDelegate(self))
-        self.setItemDelegateForColumn(6, RichTextDelegate(self))
+        self.setItemDelegateForColumn(6, PendingDiffDelegate(self)) # Use new delegate for Target
         
         # Column Resizing
         h = self.horizontalHeader()
@@ -236,11 +239,59 @@ class ModernTranslationTable(QTableView):
             row = self.units.index(unit)
             idx = self._model.index(row, 0)
             self.refresh_row(idx)
+            proxy_idx = self._proxy.mapFromSource(idx)
+            if proxy_idx.isValid():
+                self.schedule_resize_row(proxy_idx.row())
         except ValueError:
             pass # Unit not found?
+
+    def accept_pending(self, unit):
+        if not unit or not unit.pending_target:
+            return
+        unit.target_abstracted = unit.pending_target
+        unit.pending_target = None
+        unit.state = "translated"
+        self.refresh_unit(unit)
+        self.selection_changed.emit(unit)
+
+    def reject_pending(self, unit):
+        if not unit or not unit.pending_target:
+            return
+        unit.pending_target = None
+        self.refresh_unit(unit)
+        self.selection_changed.emit(unit)
             
     def filter_status(self, status):
         self._proxy.set_status_filter(status)
         
     def filter_text(self, text):
         self._proxy.set_text_filter(text)
+
+    def on_model_data_changed(self, top_left, bottom_right, roles=None):
+        if not top_left.isValid() or not bottom_right.isValid():
+            return
+
+        cols = set(range(top_left.column(), bottom_right.column() + 1))
+        if 5 not in cols and 6 not in cols:
+            return
+
+        for r in range(top_left.row(), bottom_right.row() + 1):
+            src_idx = self._model.index(r, 0)
+            proxy_idx = self._proxy.mapFromSource(src_idx)
+            if proxy_idx.isValid():
+                self.schedule_resize_row(proxy_idx.row())
+
+    def schedule_resize_row(self, view_row: int):
+        if view_row < 0:
+            return
+        if view_row in self._pending_resize_rows:
+            return
+        self._pending_resize_rows.add(view_row)
+        QTimer.singleShot(0, self.apply_scheduled_resizes)
+
+    def apply_scheduled_resizes(self):
+        rows = sorted(self._pending_resize_rows)
+        self._pending_resize_rows.clear()
+        for r in rows:
+            if 0 <= r < self.model().rowCount():
+                self.resizeRowToContents(r)

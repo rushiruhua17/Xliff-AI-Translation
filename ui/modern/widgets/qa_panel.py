@@ -44,34 +44,10 @@ class ModernQAPanel(QWidget):
         
         layout.addWidget(self.stats_card)
         
-        # Language Selectors (Hidden/ReadOnly in Project Workflow)
-        # We keep them initialized but hidden by default, or just remove them.
-        # User requested to remove them as they are set in Project Import.
-        # But we might want to show them as labels?
-        # Let's keep them but make them read-only or hidden.
-        # Actually, let's replace combos with labels for display only.
-        
-        self.lbl_langs = CaptionLabel("Src: ? -> Tgt: ?", self)
-        self.lbl_langs.setToolTip("Project Languages (Set in Project Settings)")
-        layout.addWidget(self.lbl_langs)
-        
-        # Keep references to combos for compatibility if needed, or remove completely.
-        # To avoid breaking other code that references combo_src/tgt, we can mock them or keep hidden.
-        self.combo_src = ComboBox() # Hidden
+        self.combo_src = ComboBox()
         self.combo_src.setVisible(False)
-        self.combo_tgt = ComboBox() # Hidden
+        self.combo_tgt = ComboBox()
         self.combo_tgt.setVisible(False)
-        
-        # Filter Segment
-        self.seg_filter = SegmentedWidget(self)
-        self.seg_filter.addItem("All", "All")
-        self.seg_filter.addItem("Untranslated", "Untranslated")
-        self.seg_filter.addItem("Translated", "Translated")
-        self.seg_filter.addItem("Edited", "Edited")
-        self.seg_filter.setCurrentItem("All")
-        self.seg_filter.currentItemChanged.connect(lambda k: self.filter_changed.emit(k))
-        
-        layout.addWidget(self.seg_filter)
         
         # Search Bar
         self.search_bar = SearchLineEdit(self)
@@ -81,6 +57,16 @@ class ModernQAPanel(QWidget):
         self.search_bar.textChanged.connect(self.search_changed)
         
         layout.addWidget(self.search_bar)
+
+        self.lbl_translate_progress = CaptionLabel("", self)
+        self.lbl_translate_progress.setVisible(False)
+        layout.addWidget(self.lbl_translate_progress)
+
+        self.translate_progress = ProgressBar(self)
+        self.translate_progress.setFixedWidth(180)
+        self.translate_progress.setFixedHeight(6)
+        self.translate_progress.setVisible(False)
+        layout.addWidget(self.translate_progress)
         
         layout.addStretch()
         
@@ -118,3 +104,21 @@ class ModernQAPanel(QWidget):
         self.btn_more.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         
         layout.addWidget(self.btn_more)
+
+    def start_translation_progress(self, total: int):
+        self.lbl_translate_progress.setText(f"Translating: 0/{total}")
+        self.lbl_translate_progress.setVisible(True)
+        self.translate_progress.setVisible(True)
+        self.translate_progress.setValue(0)
+
+    def update_translation_progress(self, current: int, total: int):
+        if total <= 0:
+            return
+        pct = int((current / total) * 100)
+        pct = max(0, min(100, pct))
+        self.lbl_translate_progress.setText(f"Translating: {current}/{total}")
+        self.translate_progress.setValue(pct)
+
+    def finish_translation_progress(self, message: str = "Done"):
+        self.lbl_translate_progress.setText(message)
+        self.translate_progress.setValue(100)

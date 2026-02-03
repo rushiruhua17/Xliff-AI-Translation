@@ -106,7 +106,9 @@ class HomeInterface(SingleDirectionScrollArea):
         files = config.recent_files
         
         if not files:
-            self.recent_layout.addWidget(BodyLabel("No recent files found.", self).setStyleSheet("color: gray;"))
+            lbl_none = BodyLabel("No recent files found.", self)
+            lbl_none.setStyleSheet("color: gray;")
+            self.recent_layout.addWidget(lbl_none)
         else:
             for path in files:
                 import os

@@ -106,6 +106,14 @@ class AppConfig:
         """Helper to resolve full profile config for a given task."""
         mappings = self.task_mappings
         profile_id = mappings.get(task_name)
+        if not profile_id:
+            aliases = {
+                "profile": "profile_analysis",
+                "profile_detection": "profile_analysis",
+            }
+            alias = aliases.get(task_name)
+            if alias:
+                profile_id = mappings.get(alias)
         if not profile_id: return None
         
         for p in self.model_profiles:

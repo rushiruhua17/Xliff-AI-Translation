@@ -4,6 +4,7 @@ from core.xliff_obj import TranslationUnit
 
 from core.prompt_builder import PromptBuilder
 from core.profile import TranslationProfile
+from core.prompts import SystemPrompts
 import json
 
 class TranslationWorker(QThread):
@@ -23,30 +24,37 @@ class TranslationWorker(QThread):
 
     def run(self):
         try:
+            print(f"[TranslationWorker] Starting batch translation for {len(self.units)} units.")
             total = len(self.units)
             # Batch translate in chunks of 10 to provide progress updates
             batch_size = 10
             
             # Generate System Prompt ONCE based on Profile
+            print("[TranslationWorker] Building system prompt...")
             system_instruction = PromptBuilder.build_system_message(
                 self.profile, self.source_lang, self.target_lang
             )
+            print(f"[TranslationWorker] System Prompt: {system_instruction[:100]}...")
             
             for i in range(0, total, batch_size):
                 if not self.is_running:
+                    print("[TranslationWorker] Worker stopped.")
                     break
                     
                 batch = self.units[i:i + batch_size]
+                print(f"[TranslationWorker] Processing batch {i} to {i+batch_size}")
                 
                 # Use PromptBuilder to format user message
                 segments = [{"id": u.id, "source": u.source_abstracted} for u in batch]
                 
+                print(f"[TranslationWorker] Calling client.translate_batch with {len(segments)} segments")
                 results = self.client.translate_batch(
                     segments, 
                     self.source_lang, 
                     self.target_lang,
                     system_prompt=system_instruction # Inject here
                 )
+                print(f"[TranslationWorker] Received {len(results)} results")
                 
                 # Map results back to units
                 res_map = {str(res["id"]): res["translation"] for res in results}
@@ -61,7 +69,9 @@ class TranslationWorker(QThread):
                 self.progress.emit(min(i + batch_size, total), total)
             
             self.finished.emit()
+            print("[TranslationWorker] Finished.")
         except Exception as e:
+            print(f"[TranslationWorker] Error: {e}")
             self.error.emit(str(e))
 
     def stop(self):
@@ -79,30 +89,17 @@ class ProfileGeneratorWorker(QThread):
     def run(self):
         try:
             from ai.client import LLMClient
+            from core.prompts import SystemPrompts
             client = LLMClient(**self.client_config)
             
             # 1. Construct analysis prompt (Focused on Brief fields)
-            prompt = (
-                "Analyze the following text sample and suggest a comprehensive translation brief.\n"
-                "Return strictly valid JSON matching this schema version 1.0:\n"
-                "{\n"
-                "  \"target_audience\": \"e.g. Expert Developers, End Users\",\n"
-                "  \"tone\": \"neutral|formal|casual|friendly|authoritative\",\n"
-                "  \"formality\": \"neutral|formal|informal\",\n"
-                "  \"terminology_strictness\": \"strict|prefer|loose\",\n"
-                "  \"unit_system\": \"SI|Imperial|Mixed\",\n"
-                "  \"do_not_translate\": [\"list\", \"of\", \"terms\"],\n"
-                "  \"style_guide_notes\": \"Summary of style and tone constraints\"\n"
-                "}\n"
-                "Do NOT guess client names or specific project types (e.g. 'Apple Manual'). Focus on style and linguistic properties.\n\n"
-                f"Sample Text:\n{self.sample_text[:3000]}"
-            )
+            prompt = SystemPrompts.PROFILE_GEN_USER.format(text=self.sample_text[:3000])
             
             # 2. Call LLM (Using exposed chat property)
             response = client.chat.completions.create(
                 model=client.model,
                 messages=[
-                    {"role": "system", "content": "You are a localization expert. Output ONLY valid JSON."},
+                    {"role": "system", "content": SystemPrompts.PROFILE_GEN_SYSTEM},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.3,
@@ -254,27 +251,32 @@ class WorkbenchWorker(QThread):
             
             token_str = ", ".join(tokens) if tokens else "None"
             
-            system_prompt = (
-                "You are a professional translator and editor. "
-                "Your task is to refine the translation based on user instructions.\n"
-                "CRITICAL: You must preserve all XLIFF tokens exactly as they appear in the source.\n"
-                f"Required Tokens: {token_str}\n"
-                "Output ONLY the refined translation text."
-            )
+            system_prompt = SystemPrompts.REFINE_SYSTEM.replace("{token_str}", token_str)
+            # Actually, REFINE_SYSTEM uses fixed text "Required Tokens: {token_str}" if I format it.
+            # My SystemPrompts.REFINE_SYSTEM definition was static.
+            # Let's fix SystemPrompts.REFINE_SYSTEM to be format-able or just append string.
+            # In prompts.py I wrote: "CRITICAL: ...\nOutput ONLY..."
+            # I didn't include {token_str} placeholder in the prompt file for REFINE_SYSTEM.
+            # Let me re-read prompts.py content I wrote.
+            # "CRITICAL: You must preserve all XLIFF tokens exactly as they appear in the source.\n"
+            # "Output ONLY the refined translation text."
+            # It seems I forgot to put the token list in the prompt text in prompts.py.
+            # I should update the prompt logic here to inject it.
             
-            user_prompt = (
-                f"Source: {source}\n"
-                f"Current Translation: {target}\n"
-                f"User Instruction: {instruction}\n\n"
-                "Refined Translation:"
+            full_system_prompt = SystemPrompts.REFINE_SYSTEM + f"\nRequired Tokens: {token_str}"
+            
+            user_prompt = SystemPrompts.REFINE_USER_TEMPLATE.format(
+                source=source,
+                target=target,
+                instruction=instruction
             )
             
             # Use raw client chat completion
             # Assuming client.client is the OpenAI/Compatible client
-            response = self.client.client.chat.completions.create(
+            response = self.client.chat.completions.create(
                 model=self.client.model,
                 messages=[
-                    {"role": "system", "content": system_prompt},
+                    {"role": "system", "content": full_system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
                 temperature=0.3

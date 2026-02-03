@@ -65,6 +65,9 @@ class XliffTableModel(QAbstractTableModel):
             elif unit.qa_status == "warning":
                 return QBrush(QColor(255, 255, 200))  # Light yellow for warnings
 
+        elif role == Qt.ItemDataRole.UserRole:
+            return unit # Return full object for delegates
+
         return None
 
     def headerData(self, section, orientation, role):
@@ -79,7 +82,7 @@ class XliffTableModel(QAbstractTableModel):
         unit = self.units[index.row()]
         
         if index.column() == 6:
-            if unit.state != "locked":
+            if unit.state != "locked" and not getattr(unit, "pending_target", None):
                 flags |= Qt.ItemFlag.ItemIsEditable
         
         return flags

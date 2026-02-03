@@ -1,6 +1,7 @@
 import json
 from typing import List, Dict, Any, Optional
 from core.profile import TranslationProfile, ProjectMetadata, TranslationBrief
+from core.prompts import SystemPrompts
 
 class PromptBuilder:
     """
@@ -12,10 +13,10 @@ class PromptBuilder:
         """
         Builds the system instruction strictly adhering to Phase 5 documentation.
         """
-        role = "You are a professional translator."
+        role = SystemPrompts.TRANSLATION_BASE
         
         # Base task
-        task = f"Translate the following XLIFF segments from {src_lang} to {tgt_lang}."
+        task = SystemPrompts.TRANSLATION_TASK.format(src_lang=src_lang, tgt_lang=tgt_lang)
         
         # Constraints from Profile
         constraints = []
@@ -71,21 +72,13 @@ class PromptBuilder:
             if term.forbidden_terms:
                 forbid_list = ", ".join(f'"{t}"' for t in term.forbidden_terms)
                 constraints.append(f"FORBIDDEN TERMS (Do Not Use): {forbid_list}")
-
+        
         else:
             # Legacy Fallback
             constraints.append("Preserve all placeholders and HTML tags.")
 
         # Output Format (Strict JSON)
-        json_instruction = (
-            "OUTPUT FORMAT:\n"
-            "You must output strictly valid JSON. "
-            "The root object must contain a key 'translations', which is a list of objects.\n"
-            "Each object must have:\n"
-            "  - 'id': (string, same as source)\n"
-            "  - 'translation': (string, the target text)\n"
-            "Do not include markdown formatting (```json). Return raw JSON only."
-        )
+        json_instruction = SystemPrompts.TRANSLATION_JSON_FORMAT
         
         # Assemble
         prompt_parts = [role, task]

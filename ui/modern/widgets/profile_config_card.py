@@ -13,6 +13,7 @@ class ProfileConfigCard(CardWidget):
     Used in ProjectInterface (Step 3) and EditorInterface (Dialog).
     """
     profile_saved = pyqtSignal(object) # Emits TranslationProfile
+    request_auto_detect = pyqtSignal() # New signal for AI detection
     
     def __init__(self, parent=None, title="Edit Profile (Translation Style)"):
         super().__init__(parent)
@@ -164,24 +165,63 @@ class ProfileConfigCard(CardWidget):
         brief = profile.brief
         
         # Set Tone
-        self._set_combo_text(self.combo_tone, brief.tone)
+        self._set_combo_text(self.combo_tone, self._normalize_tone(brief.tone))
         
         # Set Formality
-        self._set_combo_text(self.combo_formality, brief.formality)
+        self._set_combo_text(self.combo_formality, self._normalize_formality(brief.formality))
         
         # Set Audience
         self.txt_audience.setText(brief.target_audience)
         
         # Set Style
         self.txt_style.setText(brief.style_guide_notes)
+
+        # Advanced Fields
+        if hasattr(brief, "terminology") and brief.terminology:
+            self._set_combo_text(self.combo_strictness, brief.terminology.strictness)
+            self.chk_explanation.setChecked(bool(getattr(brief.terminology, "allow_explanation", False)))
+            dnt_list = getattr(brief.terminology, "do_not_translate", []) or []
+            self.inp_dnt.setText(", ".join(dnt_list))
+
+        if hasattr(brief, "formatting") and brief.formatting:
+            self.chk_nums.setChecked(bool(getattr(brief.formatting, "preserve_source_numbers", True)))
+            self._set_combo_text(self.combo_units, getattr(brief.formatting, "unit_system", "SI"))
+            self.chk_dual.setChecked(bool(getattr(brief.formatting, "dual_units", False)))
+
+    def _normalize_tone(self, tone: str) -> str:
+        if not tone:
+            return ""
+        mapping = {
+            "neutral": "Neutral",
+            "formal": "Formal",
+            "casual": "Casual",
+            "friendly": "Friendly",
+            "authoritative": "Authoritative",
+            "marketing": "Marketing",
+            "professional": "Formal",
+        }
+        key = str(tone).strip().lower()
+        return mapping.get(key, str(tone).strip().title())
+
+    def _normalize_formality(self, formality: str) -> str:
+        if not formality:
+            return ""
+        mapping = {
+            "neutral": "Neutral",
+            "formal": "Formal",
+            "informal": "Informal",
+        }
+        key = str(formality).strip().lower()
+        return mapping.get(key, str(formality).strip().title())
         
     def _set_combo_text(self, combo, text):
         # Workaround for ComboBox findText issue in qfluentwidgets wrapper
         # Iterate manually
-        if not text: return
+        if not text:
+            return
         
         for i in range(combo.count()):
-            if combo.itemText(i) == text:
+            if combo.itemText(i).strip().lower() == str(text).strip().lower():
                 combo.setCurrentIndex(i)
                 return
         
@@ -190,8 +230,13 @@ class ProfileConfigCard(CardWidget):
         if not text:
             combo.setCurrentIndex(0)
         else:
-            combo.addItem(text)
-            combo.setCurrentText(text)
+            combo.setCurrentIndex(0)
+
+    def get_current_profile(self):
+        """Public method to get the current configured profile"""
+        # Ensure latest values are captured
+        self.save_profile() # This updates self.profile from UI
+        return self.profile
 
     def save_profile(self):
         """Collect data and emit"""
@@ -226,14 +271,14 @@ class ProfileConfigCard(CardWidget):
         self.btn_save.setIcon(None)
 
     def auto_detect(self):
-        """Mock Auto-Detect Logic"""
-        # In a real app, this would call an LLM with the source file content
-        self.combo_tone.setCurrentText("Professional")
-        self.combo_formality.setCurrentText("Formal")
-        self.txt_audience.setText("General Public")
-        self.txt_style.setText("Maintain clarity and conciseness. Use active voice where possible.")
+        """Emit signal to request AI analysis"""
+        self.btn_auto.setText("Analyzing...")
+        self.btn_auto.setEnabled(False)
+        self.request_auto_detect.emit()
         
-        # Visual feedback
+    def on_auto_detect_finished(self):
+        """Reset button state"""
         self.btn_auto.setText("Detected!")
+        self.btn_auto.setEnabled(True)
         from PyQt6.QtCore import QTimer
-        QTimer.singleShot(2000, lambda: self.btn_auto.setText("✨ Auto-Detect"))
+        QTimer.singleShot(1500, lambda: self.btn_auto.setText("✨ Auto-Detect"))

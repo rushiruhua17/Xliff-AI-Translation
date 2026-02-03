@@ -102,6 +102,9 @@ class Autosaver:
             if 'temp_name' in locals() and os.path.exists(temp_name):
                 os.remove(temp_name)
 
+    def save(self, current_units: List[TranslationUnit]):
+        return self.save_patch(current_units)
+
     def check_recovery_available(self) -> Optional[Dict[str, Any]]:
         """
         Checks if a valid autosave file exists for the current original file.
@@ -140,3 +143,6 @@ class Autosaver:
                 logger.info(f"Autosave cleaned up: {self.autosave_path}")
             except Exception as e:
                 logger.error(f"Failed to cleanup autosave: {e}")
+
+    def clear_autosave(self):
+        return self.cleanup()
